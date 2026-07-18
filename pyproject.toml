@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.scripts]
-rename-images = "rename_images:main"
+rename-images = "rename_images:cli"
 
 [build-system]
 requires = ["hatchling"]

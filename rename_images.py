@@ -16,9 +16,10 @@ reflects the current state of this checkout.
 
 Usage:
     # Dry run (default) — shows what WOULD happen, doesn't touch files.
-    # Results (including the model's description of each image) are cached,
-    # so a later run against the same folder skips inference for any file
-    # whose contents haven't changed.
+    # Results (including the model's description and EXIF data of each
+    # image) are cached, so a later run against the same folder skips
+    # inference for any file whose contents haven't changed. `rename` is the
+    # default subcommand, so it can be omitted, as below.
     rename-images /path/to/folder
 
     # Actually rename the files — reuses the dry-run cache, so this is fast
@@ -32,6 +33,10 @@ Usage:
     # running MLX locally (see "Remote backend" in CLAUDE.md for setup)
     rename-images /path/to/folder -u http://192.168.1.50:11434
 
+    # Send up to 4 images to the remote server concurrently instead of one
+    # at a time (only helps if the server can serve requests in parallel)
+    rename-images /path/to/folder -u http://192.168.1.50:11434 -w 4
+
     # Recurse into subfolders
     rename-images /path/to/folder -a -r
 
@@ -40,6 +45,11 @@ Usage:
 
     # Ignore the cache and re-run inference on every image
     rename-images /path/to/folder -c
+
+    # Print EXIF metadata for one image, or every image in a folder
+    # (recursively with -r), as a table (default) or JSON
+    rename-images exif /path/to/photo.jpg
+    rename-images exif /path/to/folder -r -f json
 """
 
 import base64
@@ -56,6 +66,26 @@ from typing import NamedTuple
 
 import click
 from PIL import ExifTags, Image
+from PIL.TiffImagePlugin import IFDRational
+
+# Tags that are just byte-offset pointers to the Exif/GPS sub-IFDs, not real
+# data — their actual contents are extracted separately and merged in under
+# proper names, so the raw pointer values would just be noise.
+_EXIF_POINTER_TAGS = {34665, 34853}  # ExifOffset, GPSInfo
+
+# MakerNote is an opaque, manufacturer-proprietary binary blob (format
+# undocumented and different per camera maker) that Pillow can't decode —
+# it just comes back as raw bytes, which our cleanup then hex-encodes into
+# a very long, not-actually-useful string. Excluded by default; pass
+# include_maker_note=True (the exif command's -M/--maker-note) to keep it.
+_MAKER_NOTE_TAG = 37500
+
+# UserComment is often empty/null-padded in practice, and even when it has
+# real text, Pillow returns it with its raw 8-byte charset-code prefix
+# (e.g. b"ASCII\x00\x00\x00...") rather than a clean decoded string, so it's
+# excluded by default too; pass include_user_comment=True (the exif command's
+# -U/--user-comment) to keep it.
+_USER_COMMENT_TAG = 37510
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".webp", ".bmp", ".tiff", ".gif"}
 
@@ -101,20 +131,90 @@ def slugify(text: str, max_words: int = 5) -> str:
     return slug or "image"
 
 
-def get_photo_date(path: Path) -> datetime:
-    """Get the date a photo was taken from EXIF, falling back to file creation time."""
+def _tag_name(enum_cls, tag_id: int) -> str:
+    """Resolve a numeric EXIF tag id to its name via a Pillow tag enum, falling back to the id."""
+    try:
+        return enum_cls(tag_id).name
+    except ValueError:
+        return str(tag_id)
+
+
+def _clean_exif_value(value):
+    """Make a raw EXIF value JSON-safe and human-readable."""
+    if isinstance(value, bytes):
+        try:
+            text = value.decode("ascii").rstrip("\x00")
+        except UnicodeDecodeError:
+            text = None
+        return text if text and text.isprintable() else value.hex()
+    if isinstance(value, tuple):
+        return [_clean_exif_value(v) for v in value]
+    if isinstance(value, IFDRational):
+        return float(value)
+    return value
+
+
+def _parse_exif(exif, include_maker_note: bool = False, include_user_comment: bool = False) -> dict:
+    """Flatten a PIL Exif object (base IFD + Exif and GPS sub-IFDs) into a JSON-safe dict."""
+    data = {}
+    for tag_id, value in exif.items():
+        if tag_id in _EXIF_POINTER_TAGS:
+            continue
+        data[_tag_name(ExifTags.Base, tag_id)] = _clean_exif_value(value)
+
+    for tag_id, value in exif.get_ifd(ExifTags.IFD.Exif).items():
+        if tag_id == _MAKER_NOTE_TAG and not include_maker_note:
+            continue
+        if tag_id == _USER_COMMENT_TAG and not include_user_comment:
+            continue
+        data[_tag_name(ExifTags.Base, tag_id)] = _clean_exif_value(value)
+
+    gps = exif.get_ifd(ExifTags.IFD.GPSInfo)
+    if gps:
+        data["GPSInfo"] = {
+            _tag_name(ExifTags.GPS, tag_id): _clean_exif_value(value) for tag_id, value in gps.items()
+        }
+
+    return data
+
+
+def get_photo_metadata(
+    path: Path, include_maker_note: bool = False, include_user_comment: bool = False
+) -> tuple[datetime, dict]:
+    """Get (photo date, full EXIF dict) for an image in a single file open.
+
+    The date falls back to the file's creation time when EXIF has no usable
+    date tag (or the image has no/unreadable EXIF at all); the EXIF dict is
+    empty in that case too.
+    """
+    exif_data = {}
+    date = None
     try:
         with Image.open(path) as img:
             exif = img.getexif()
-            exif_ifd = exif.get_ifd(ExifTags.IFD.Exif)
-            raw = exif_ifd.get(ExifTags.Base.DateTimeOriginal) or exif.get(ExifTags.Base.DateTime)
-            if raw:
-                return datetime.strptime(raw, "%Y:%m:%d %H:%M:%S")
+            if exif:
+                exif_data = _parse_exif(
+                    exif, include_maker_note=include_maker_note, include_user_comment=include_user_comment
+                )
+                exif_ifd = exif.get_ifd(ExifTags.IFD.Exif)
+                raw = exif_ifd.get(ExifTags.Base.DateTimeOriginal) or exif.get(ExifTags.Base.DateTime)
+                if raw:
+                    date = datetime.strptime(raw, "%Y:%m:%d %H:%M:%S")
     except Exception:
         pass
 
-    stat = path.stat()
-    return datetime.fromtimestamp(getattr(stat, "st_birthtime", stat.st_ctime))
+    if date is None:
+        stat = path.stat()
+        date = datetime.fromtimestamp(getattr(stat, "st_birthtime", stat.st_ctime))
+
+    return date, exif_data
+
+
+def get_exif_data(path: Path, include_maker_note: bool = False, include_user_comment: bool = False) -> dict:
+    """Get just the EXIF dict for one image (used by the standalone `exif` command)."""
+    return get_photo_metadata(
+        path, include_maker_note=include_maker_note, include_user_comment=include_user_comment
+    )[1]
 
 
 def unique_path(target: Path) -> Path:
@@ -232,7 +332,31 @@ def generate_remote(remote_url: str, model_name: str, img_path: Path, max_tokens
     )
 
 
-@click.command()
+class DefaultGroup(click.Group):
+    """A click.Group that falls back to a default subcommand when none is given.
+
+    Lets `rename-images /path -a ...` keep working exactly as before now that
+    the CLI has multiple subcommands — only an explicit, recognized
+    subcommand name (or --help/-h) is treated as one; anything else is
+    routed to `default_command`.
+    """
+
+    def __init__(self, *args, default_command: str, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.default_command = default_command
+
+    def resolve_command(self, ctx, args):
+        if args and (args[0] in self.commands or args[0] in ("--help", "-h")):
+            return super().resolve_command(ctx, args)
+        return super().resolve_command(ctx, [self.default_command, *args])
+
+
+@click.group(cls=DefaultGroup, default_command="rename")
+def cli():
+    """Rename images by their content (default), or inspect their EXIF data."""
+
+
+@cli.command("rename")
 @click.argument("folder", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path))
 @click.option("-a", "--apply", is_flag=True, help="Actually rename files (default is dry-run)")
 @click.option("-r", "--recursive", is_flag=True, help="Recurse into subfolders")
@@ -254,7 +378,16 @@ def generate_remote(remote_url: str, model_name: str, img_path: Path, max_tokens
     help="Offload inference to an Ollama server at this base URL (e.g. http://192.168.1.50:11434) "
     "instead of running MLX locally",
 )
-def main(
+@click.option(
+    "-w",
+    "--workers",
+    type=click.IntRange(min=1),
+    default=1,
+    show_default=True,
+    help="Concurrent requests to the remote backend (-u/--remote-url only; no effect on local "
+    "MLX, which can't be parallelized)",
+)
+def rename_cmd(
     folder: Path,
     apply: bool,
     recursive: bool,
@@ -263,6 +396,7 @@ def main(
     verbose: bool,
     no_cache: bool,
     remote_url: str | None,
+    workers: int,
 ):
     """Rename images based on their content using a vision model, local or remote."""
     if model_name is None:
@@ -279,12 +413,8 @@ def main(
     # EXIF/file-date lookups are I/O-bound and independent per image, so kick
     # them off on a thread pool now — they run alongside the (I/O-heavy)
     # model load below and are essentially free by the time we need them.
-    # The actual generation loop stays single-threaded on purpose: mlx-vlm
-    # funnels all inference through one shared GPU/model instance, so
-    # threading those calls wouldn't add real parallelism, only risk. The
-    # remote/Ollama path is likewise kept sequential for now to match.
     date_pool = ThreadPoolExecutor()
-    date_futures = {img_path: date_pool.submit(get_photo_date, img_path) for img_path in images}
+    metadata_futures = {img_path: date_pool.submit(get_photo_metadata, img_path) for img_path in images}
 
     backend = f"remote ({remote_url})" if remote_url else "local MLX"
     mode = "APPLYING RENAMES" if apply else "DRY RUN (use --apply to actually rename)"
@@ -295,39 +425,84 @@ def main(
     # description generated by a different model.
     cache_model_key = f"{'remote' if remote_url else 'local'}:{model_name}"
 
-    # The local model is loaded lazily, on the first cache miss. If a prior
-    # dry run already produced a description for every image (and none
-    # changed since), an --apply pass can rename everything without ever
-    # touching MLX. The remote backend's equivalent is a one-time preflight
-    # check (reachability + model pulled) instead of a load step.
+    # Checksums are computed once up front (rather than inline per image)
+    # so the same values can be used both to find cache misses before the
+    # main loop (for the remote pre-pass below) and inside it.
+    checksums = {img_path: file_checksum(img_path) for img_path in images}
+
+    def is_cache_hit(img_path: Path) -> bool:
+        cached = cache["entries"].get(str(img_path.relative_to(folder)))
+        return (
+            not no_cache
+            and cached is not None
+            and cached.get("checksum") == checksums[img_path]
+            and cached.get("model") == cache_model_key
+        )
+
+    # The local model is loaded lazily, on the first cache miss, and its
+    # generate() calls stay strictly sequential: mlx-vlm funnels all
+    # inference through one shared GPU/model instance, so threading those
+    # calls wouldn't add real parallelism (Metal serializes the GPU work
+    # anyway), only risk. See "Why the inference loop isn't threaded" in
+    # CLAUDE.md.
+    #
+    # The remote backend has no such constraint — each call is an
+    # independent HTTP request to (possibly) another machine — so cache
+    # misses are farmed out to a thread pool up front, sized by
+    # -w/--workers (default 1, i.e. today's sequential behavior). Results
+    # are collected here and consumed by the main loop below in the
+    # original image order, so output ordering and cache/rename logic stay
+    # exactly as deterministic as the single-threaded path.
     model = processor = config = None
-    remote_checked = False
+    remote_results: dict[Path, GenResult] = {}
+    failed_images: set[Path] = set()
+
+    if remote_url:
+        misses = [img_path for img_path in images if not is_cache_hit(img_path)]
+        if misses:
+            check_remote_backend(remote_url, model_name)
+            with ThreadPoolExecutor(max_workers=workers) as remote_pool:
+                futures = {
+                    img_path: remote_pool.submit(generate_remote, remote_url, model_name, img_path, max_tokens)
+                    for img_path in misses
+                }
+                # Reported here (in submission order, blocking per image as
+                # needed) rather than only after the whole pre-pass finishes —
+                # with many images and a small worker count, waiting until
+                # everything is done before printing anything would look
+                # exactly like a hang.
+                for i, (img_path, future) in enumerate(futures.items(), start=1):
+                    prefix = f"  [{i}/{len(misses)}]"
+                    try:
+                        result = future.result()
+                    except Exception as e:
+                        click.echo(f"{prefix} [SKIP] {img_path.name}: remote error ({e})")
+                        failed_images.add(img_path)
+                        continue
+                    remote_results[img_path] = result
+                    progress = f"{prefix} {img_path.name}"
+                    if verbose and result.tokens is not None:
+                        hit_limit = " (hit --max-tokens limit)" if result.hit_limit else ""
+                        progress += f": {result.tokens} tokens{hit_limit}"
+                    click.echo(progress)
 
     used_names = set()
 
     for img_path in images:
         rel_key = str(img_path.relative_to(folder))
-        checksum = file_checksum(img_path)
+        checksum = checksums[img_path]
+        date, exif_data = metadata_futures[img_path].result()
         cached = cache["entries"].get(rel_key)
-        cache_hit = (
-            not no_cache
-            and cached is not None
-            and cached.get("checksum") == checksum
-            and cached.get("model") == cache_model_key
-        )
+        cache_hit = is_cache_hit(img_path)
 
         if cache_hit:
             desc = cached["desc"]
         else:
             if remote_url:
-                if not remote_checked:
-                    check_remote_backend(remote_url, model_name)
-                    remote_checked = True
-                try:
-                    result = generate_remote(remote_url, model_name, img_path, max_tokens)
-                except Exception as e:
-                    click.echo(f"  [SKIP] {img_path.name}: remote error ({e})")
+                if img_path in failed_images:
+                    # Already reported during the pre-pass above.
                     continue
+                result = remote_results[img_path]
             else:
                 if model is None:
                     try:
@@ -363,7 +538,9 @@ def main(
                     hit_limit=getattr(response, "finish_reason", None) == "length",
                 )
 
-            if verbose and result.tokens is not None:
+            if not remote_url and verbose and result.tokens is not None:
+                # For the remote backend this was already printed during the
+                # concurrent pre-pass above, as each request completed.
                 hit_limit = " (hit --max-tokens limit)" if result.hit_limit else ""
                 click.echo(f"  [{img_path.name}] {result.tokens} tokens{hit_limit}")
 
@@ -377,7 +554,16 @@ def main(
             cache["entries"][rel_key] = {"checksum": checksum, "model": cache_model_key, "desc": desc}
             cache_dirty = True
 
-        date_str = date_futures[img_path].result().strftime("%Y-%m-%d")
+        # Keep the cached EXIF dict current regardless of whether desc was a
+        # cache hit — it's independent of the model/backend and cheap to
+        # have on hand, so every processed image ends up with it recorded,
+        # including entries created before this field existed.
+        entry = cache["entries"][rel_key]
+        if entry.get("exif") != exif_data:
+            entry["exif"] = exif_data
+            cache_dirty = True
+
+        date_str = date.strftime("%Y-%m-%d")
         slug = f"{date_str}-{desc}"
         # avoid collisions within this run before touching disk
         base_slug = slug
@@ -408,5 +594,85 @@ def main(
         click.echo("\nNo files were changed (dry run). Re-run with --apply to rename them.")
 
 
+def _table_rows(data: dict, prefix: str = "") -> list[tuple[str, object]]:
+    """Flatten a (possibly one-level-nested, e.g. GPSInfo) EXIF dict into (tag, value) rows for table display."""
+    rows = []
+    for tag, value in data.items():
+        if isinstance(value, dict):
+            rows.extend(_table_rows(value, prefix=f"{tag}."))
+        else:
+            rows.append((f"{prefix}{tag}", value))
+    return rows
+
+
+@cli.command("exif")
+@click.argument("path", type=click.Path(exists=True, path_type=Path))
+@click.option("-r", "--recursive", is_flag=True, help="Recurse into subfolders when PATH is a directory")
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    show_default=True,
+    help="Output format",
+)
+@click.option(
+    "-M",
+    "--maker-note",
+    "include_maker_note",
+    is_flag=True,
+    help="Include the MakerNote tag (opaque, manufacturer-proprietary binary data; omitted by default)",
+)
+@click.option(
+    "-U",
+    "--user-comment",
+    "include_user_comment",
+    is_flag=True,
+    help="Include the UserComment tag (often empty/null-padded, and undecoded when present; omitted by default)",
+)
+def exif_cmd(
+    path: Path,
+    recursive: bool,
+    output_format: str,
+    include_maker_note: bool,
+    include_user_comment: bool,
+):
+    """Print EXIF metadata for an image file, or every image in a folder."""
+    if path.is_dir():
+        images = list(find_images(path, recursive))
+        root = path
+    else:
+        images = [path]
+        root = path.parent
+
+    if not images:
+        click.echo("No images found.")
+        return
+
+    results = {
+        str(img_path.relative_to(root)): get_exif_data(
+            img_path, include_maker_note=include_maker_note, include_user_comment=include_user_comment
+        )
+        for img_path in images
+    }
+
+    if output_format == "json":
+        click.echo(json.dumps(results, indent=2, sort_keys=True))
+        return
+
+    for i, (key, data) in enumerate(results.items()):
+        if i:
+            click.echo()
+        click.echo(key)
+        rows = _table_rows(data)
+        if not rows:
+            click.echo("  (no EXIF data)")
+            continue
+        width = max(len(tag) for tag, _ in rows)
+        for tag, value in rows:
+            click.echo(f"  {tag:<{width}}  {value}")
+
+
 if __name__ == "__main__":
-    main()
+    cli()
