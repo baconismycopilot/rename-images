@@ -54,6 +54,7 @@ Usage:
 
 import base64
 import hashlib
+import io
 import json
 import re
 import sys
@@ -65,8 +66,17 @@ from pathlib import Path
 from typing import NamedTuple
 
 import click
-from PIL import ExifTags, Image
+from PIL import ExifTags, Image, ImageOps
 from PIL.TiffImagePlugin import IFDRational
+from pillow_heif import register_heif_opener
+
+# Teach Pillow to open HEIC/HEIF (iPhone photos). Stock Pillow ships no HEIC
+# codec, so without this every HEIC file silently fell back to file-creation
+# time and an empty EXIF dict (Image.open() raised, swallowed by
+# get_photo_metadata's fallback), and the local MLX path couldn't load them
+# either. Registration is process-global, so mlx_vlm's own PIL loading
+# benefits too.
+register_heif_opener()
 
 # Tags that are just byte-offset pointers to the Exif/GPS sub-IFDs, not real
 # data — their actual contents are extracted separately and merged in under
@@ -88,6 +98,11 @@ _MAKER_NOTE_TAG = 37500
 _USER_COMMENT_TAG = 37510
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".webp", ".bmp", ".tiff", ".gif"}
+
+# Formats Ollama's server-side image loader decodes natively. Anything else
+# (HEIC most notably) gets HTTP 400 "Failed to load image or audio file"
+# back, so _remote_image_bytes() transcodes those to JPEG before upload.
+_REMOTE_NATIVE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
 CACHE_FILENAME = ".rename-images-cache.json"
 CACHE_VERSION = 1
@@ -294,13 +309,38 @@ def check_remote_backend(remote_url: str, model_name: str) -> None:
         sys.exit(1)
 
 
+def _remote_image_bytes(img_path: Path) -> bytes:
+    """Get an image's bytes in a format the remote Ollama server can decode.
+
+    JPEG/PNG pass through untouched (no re-encode loss, no work). Everything
+    else — HEIC especially, which Ollama rejects with an HTTP 400 — is
+    transcoded to JPEG in-memory. The transcoded copy carries no EXIF, so
+    orientation is baked into the pixels first (exif_transpose); a side
+    effect is that GPS and other metadata never leave the machine for these
+    formats. The file on disk is never modified.
+    """
+    if img_path.suffix.lower() in _REMOTE_NATIVE_SUFFIXES:
+        return img_path.read_bytes()
+    try:
+        with Image.open(img_path) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG", quality=90)
+            return buffer.getvalue()
+    except Exception as e:
+        raise RuntimeError(f"could not convert {img_path.suffix} to JPEG for the remote backend ({e})") from e
+
+
 def generate_remote(remote_url: str, model_name: str, img_path: Path, max_tokens: int) -> GenResult:
     """Caption an image via a remote Ollama server's /api/generate endpoint.
 
-    Uses only the stdlib (urllib) so the client side stays dependency-free —
-    the only thing required on the remote machine is Ollama itself.
+    HTTP is plain stdlib urllib — the only thing required on the remote
+    machine is Ollama itself. Formats Ollama can't decode are transcoded to
+    JPEG client-side first (see _remote_image_bytes).
     """
-    image_b64 = base64.b64encode(img_path.read_bytes()).decode("ascii")
+    image_b64 = base64.b64encode(_remote_image_bytes(img_path)).decode("ascii")
     payload = {
         "model": model_name,
         "prompt": PROMPT,

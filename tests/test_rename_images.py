@@ -8,12 +8,13 @@ generation/cache/CLI code paths against a lightweight stand-in server.
 """
 
 import base64
+import io
 import json
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
-from PIL import Image
+from PIL import ExifTags, Image
 
 import rename_images as ri
 
@@ -151,8 +152,6 @@ def test_get_exif_data_returns_empty_dict_when_no_exif(tmp_path):
 
 
 def _make_image_with_maker_note(path: Path) -> None:
-    from PIL import ExifTags
-
     img = Image.new("RGB", (4, 4), color="blue")
     exif = img.getexif()
     exif.get_ifd(ExifTags.IFD.Exif)[ri._MAKER_NOTE_TAG] = b"PROPRIETARYDATA"
@@ -173,8 +172,6 @@ def test_get_exif_data_includes_maker_note_when_requested(tmp_path):
 
 
 def _make_image_with_user_comment(path: Path) -> None:
-    from PIL import ExifTags
-
     img = Image.new("RGB", (4, 4), color="blue")
     exif = img.getexif()
     exif.get_ifd(ExifTags.IFD.Exif)[ri._USER_COMMENT_TAG] = b"ASCII\x00\x00\x00hello"
@@ -192,6 +189,97 @@ def test_get_exif_data_includes_user_comment_when_requested(tmp_path):
     _make_image_with_user_comment(path)
     data = ri.get_exif_data(path, include_user_comment=True)
     assert "UserComment" in data
+
+
+# ---------- HEIC support / _remote_image_bytes ----------
+
+
+def _make_heic_image(path: Path, exif=None) -> None:
+    """Save a HEIC file — works because rename_images registers pillow-heif's opener on import."""
+    img = Image.new("RGB", (8, 4), color="red")
+    img.save(path, exif=exif if exif is not None else img.getexif())
+
+
+def test_remote_image_bytes_passes_jpeg_and_png_through_untouched(tmp_path):
+    for name in ("photo.jpg", "photo.png"):
+        path = tmp_path / name
+        _make_image(path)
+        assert ri._remote_image_bytes(path) == path.read_bytes()
+
+
+def test_remote_image_bytes_transcodes_heic_to_jpeg(tmp_path):
+    path = tmp_path / "photo.heic"
+    _make_heic_image(path)
+
+    data = ri._remote_image_bytes(path)
+
+    assert data[:3] == b"\xff\xd8\xff"  # JPEG magic bytes
+    assert Image.open(io.BytesIO(data)).size == (8, 4)
+
+
+def test_remote_image_bytes_bakes_orientation_into_transcoded_pixels(tmp_path):
+    path = tmp_path / "photo.webp"
+    img = Image.new("RGB", (8, 4), color="blue")
+    exif = img.getexif()
+    exif[ExifTags.Base.Orientation] = 6  # rotate 90° CW to display upright
+    img.save(path, exif=exif)
+
+    out = Image.open(io.BytesIO(ri._remote_image_bytes(path)))
+
+    assert out.size == (4, 8)  # dimensions swapped: rotation applied to pixels
+
+
+def test_remote_image_bytes_raises_clear_error_for_undecodable_file(tmp_path):
+    path = tmp_path / "corrupt.heic"
+    path.write_bytes(b"this is not an image")
+
+    with pytest.raises(RuntimeError, match="could not convert .heic"):
+        ri._remote_image_bytes(path)
+
+
+def test_get_photo_metadata_reads_heic_exif_date(tmp_path):
+    path = tmp_path / "photo.heic"
+    img = Image.new("RGB", (8, 4), color="red")
+    exif = img.getexif()
+    exif.get_ifd(ExifTags.IFD.Exif)[ExifTags.Base.DateTimeOriginal] = "2023:05:01 12:00:00"
+    _make_heic_image(path, exif=exif)
+
+    date, exif_data = ri.get_photo_metadata(path)
+
+    assert (date.year, date.month, date.day) == (2023, 5, 1)
+    assert exif_data["DateTimeOriginal"] == "2023:05:01 12:00:00"
+
+
+def test_generate_remote_sends_transcoded_jpeg_for_heic(tmp_path, mock_ollama):
+    mock_ollama.set_generate_response(
+        {"response": "a red rectangle", "eval_count": 3, "done_reason": "stop"}
+    )
+    path = tmp_path / "photo.heic"
+    _make_heic_image(path)
+
+    result = ri.generate_remote(mock_ollama.url, "qwen2.5vl:7b", path, max_tokens=30)
+
+    assert result.text == "a red rectangle"
+    sent = base64.b64decode(mock_ollama.server.state["generate_calls"][0]["images"][0])
+    assert sent[:3] == b"\xff\xd8\xff"  # server received JPEG, not raw HEIC
+
+
+def test_cli_renames_heic_via_remote_backend(tmp_path, mock_ollama):
+    """End-to-end: a HEIC file must reach the remote backend as JPEG and get a date-prefixed slug name."""
+    mock_ollama.set_models(["qwen2.5vl:7b"])
+    mock_ollama.set_generate_response(
+        {"response": "a red rectangle", "eval_count": 3, "done_reason": "stop"}
+    )
+    img = Image.new("RGB", (8, 4), color="red")
+    exif = img.getexif()
+    exif.get_ifd(ExifTags.IFD.Exif)[ExifTags.Base.DateTimeOriginal] = "2023:05:01 12:00:00"
+    _make_heic_image(tmp_path / "IMG_0173.heic", exif=exif)
+
+    result = CliRunner().invoke(ri.cli, [str(tmp_path), "-u", mock_ollama.url, "-a"])
+
+    assert result.exit_code == 0
+    assert "[SKIP]" not in result.output
+    assert (tmp_path / "2023-05-01-a-red-rectangle.heic").exists()
 
 
 # ---------- remote backend (generate_remote / check_remote_backend) ----------
