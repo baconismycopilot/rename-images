@@ -1,0 +1,26 @@
+[project]
+name = "rename-images"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "click>=8.4.2",
+    "mlx-vlm>=0.6.5",
+    "pillow>=12.3.0",
+]
+
+[project.scripts]
+rename-images = "rename_images:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.15.22",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
