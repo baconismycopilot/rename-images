@@ -1,5 +1,7 @@
 # rename-images
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A CLI that renames image files based on what's actually *in* them — instead of `IMG_0842.JPG`, you get `2024-08-12-golden-retriever-on-beach.jpg`. A vision-language model looks at each image and generates a short description, which becomes the new filename, prefixed with the date the photo was taken.
 
 By default, everything runs locally on Apple Silicon via [MLX](https://github.com/ml-explore/mlx) — no image data or API calls leave your machine. There's also an optional remote mode that offloads the same workload to another machine (e.g. one with a CUDA GPU) over your network.
