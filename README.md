@@ -10,8 +10,10 @@ By default, everything runs locally on Apple Silicon via [MLX](https://github.co
 
 - **Content-aware renaming** — a VLM captions each image in 2–5 words; combined with the photo's EXIF/file date, that becomes the new filename.
 - **Dry-run by default** — renaming is destructive, so the tool only *prints* what it would do until you pass `-a/--apply`.
-- **Description cache** — every processed image's description is cached (keyed by a checksum of its contents), so a `dry-run → review → --apply` workflow only ever runs inference once per image, not twice. Editing an image or switching models automatically invalidates its cache entry.
-- **Remote offload** — point the tool at an [Ollama](https://ollama.com) server on another machine (`-u/--remote-url`) to run inference on a more capable GPU instead of the local Apple Silicon device. The tool checks that the remote server is reachable and has the requested model *before* processing anything, and prints setup guidance directly if it isn't.
+- **Description cache** — every processed image's description (and EXIF data) is cached (keyed by a checksum of its contents), so a `dry-run → review → --apply` workflow only ever runs inference once per image, not twice. Editing an image or switching models automatically invalidates its cache entry.
+- **Remote offload** — point the tool at an [Ollama](https://ollama.com) server on another machine (`-u/--remote-url`) to run inference on a more capable GPU instead of the local Apple Silicon device. The tool checks that the remote server is reachable and has the requested model *before* processing anything, and prints setup guidance directly if it isn't. `-w/--workers` sends multiple images to the remote server concurrently instead of one at a time (real speedup depends on the server's own concurrency, not just this flag).
+- **EXIF inspection** — a separate `exif` command prints an image's (or a whole folder's) EXIF metadata as a table or JSON, no renaming involved.
+- **HEIC support** — iPhone photos work everywhere (dates, EXIF, both backends) via [pillow-heif](https://pypi.org/project/pillow-heif/). Since Ollama can't decode HEIC server-side, the remote backend transparently converts HEIC (and other non-JPEG/PNG formats) to JPEG in memory before upload — the files on disk are never modified, and stripped metadata (GPS etc.) stays local.
 - **Safe collision handling** — won't overwrite files; duplicate slugs within a run or on disk get `-2`, `-3`, ... suffixes.
 - **Recursive mode**, **tunable output length** (`--max-tokens`), and a **verbose mode** for tuning token limits.
 
@@ -32,6 +34,8 @@ uv tool install --editable .
 `--editable` means the installed `rename-images` command always reflects the current state of this checkout — no reinstall needed after editing the script. A `Makefile` is also provided (`make install`, `make install-tool`, `make lint`, `make test`, `make help`).
 
 ## Usage
+
+`rename-images` is a group with two subcommands, `rename` and `exif`. `rename` is the default, so it can be omitted — `rename-images /path/to/folder` and `rename-images rename /path/to/folder` do the same thing.
 
 ```bash
 # Dry run (default) — prints what would be renamed, touches nothing
@@ -54,11 +58,21 @@ rename-images /path/to/folder -c
 
 # Offload inference to a remote Ollama server instead of running MLX locally
 rename-images /path/to/folder -u http://192.168.1.50:11434
+
+# Same, but send up to 4 images to the remote server concurrently
+rename-images /path/to/folder -u http://192.168.1.50:11434 -w 4
+
+# Print EXIF metadata for one image, or a whole folder (-r to recurse),
+# as a table (default) or JSON — read-only, never renames anything
+rename-images exif /path/to/photo.jpg
+rename-images exif /path/to/folder -r -f json
 ```
 
 `uv run rename_images.py ...` works identically from inside this repo if you don't want to install the tool globally.
 
 ### All options
+
+**`rename`** (default subcommand)
 
 | Flag | Description |
 |---|---|
@@ -69,6 +83,16 @@ rename-images /path/to/folder -u http://192.168.1.50:11434
 | `-v, --verbose` | Print tokens generated per image |
 | `-c, --no-cache` | Skip the description cache and re-run inference on every image |
 | `-u, --remote-url TEXT` | Offload inference to an Ollama server at this base URL |
+| `-w, --workers INTEGER` | Concurrent requests to the remote backend (default: 1); no effect without `-u` |
+
+**`exif`**
+
+| Flag | Description |
+|---|---|
+| `-r, --recursive` | Recurse into subfolders when the given path is a directory |
+| `-f, --format [table\|json]` | Output format (default: table) |
+| `-M, --maker-note` | Include the `MakerNote` tag (opaque, manufacturer-proprietary binary data; omitted by default) |
+| `-U, --user-comment` | Include the `UserComment` tag (often empty/null-padded, and undecoded when present; omitted by default) |
 
 ## Remote offload setup
 
@@ -99,6 +123,14 @@ rename-images /path/to/folder -u http://<remote-host>:11434
 If the server isn't reachable, or the requested model hasn't been pulled there, the tool fails fast with a clear message (unreachable server → the checklist above; missing model → which models *are* available and the exact `ollama pull` command to fix it) instead of silently timing out or retrying per image. This check only happens if at least one image actually needs processing — a fully-cached run never touches the network at all.
 
 The remote and local backends are cached separately, so switching between them (or changing `-m`) never reuses a description generated by a different backend/model.
+
+Ollama can only decode JPEG and PNG server-side — anything else it rejects with an HTTP 400 ("Failed to load image or audio file") regardless of which model is loaded. `rename-images` handles this for you: HEIC and other formats are converted to JPEG in memory just for the upload, so you never see those errors and nothing on disk is touched.
+
+### Speeding it up with `-w/--workers`
+
+By default, images are sent to the remote server one at a time (`-w 1`), same as local MLX. If your Ollama server can actually handle multiple requests at once — governed by its `OLLAMA_NUM_PARALLEL` setting and whether the model + available VRAM support more than one loaded context — raising `-w` sends that many images concurrently instead. This is a real speedup, not a placebo: with a mock server that takes ~1s per request, 4 images took ~4.2s at `-w 1` versus ~1.2s at `-w 4`. If the server can only serve one request at a time regardless, raising `-w` just queues requests server-side with no benefit — it won't make things worse, but it won't help either. Output ordering, caching, and renaming are unaffected either way: results are gathered before the (single-threaded) rename logic runs, in the original file order.
+
+With a large folder and a small `-w`, this can take a while — you'll see a `[i/N] filename` line printed as each image's request completes (with a token count if `-v` is set, or `[SKIP] filename: ...` if it failed), so it's visibly making progress rather than appearing to hang. The final `old -> new` rename lines print afterward, in a second pass.
 
 ## Development
 
