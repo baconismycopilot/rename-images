@@ -21,8 +21,15 @@ class _MockOllamaHandler(BaseHTTPRequestHandler):
         length = int(self.headers["Content-Length"])
         payload = json.loads(self.rfile.read(length))
         self.server.state["generate_calls"].append(payload)
-        body = json.dumps(self.server.state["generate_response"]).encode()
-        self._send(self.server.state["generate_status"], body)
+        response_fn = self.server.state["generate_response_fn"]
+        if response_fn:
+            result = response_fn(payload)
+            # response_fn may return just a body dict, or (status, body dict)
+            # for per-request status codes (e.g. simulating one failing image).
+            status, body = result if isinstance(result, tuple) else (200, result)
+        else:
+            status, body = self.server.state["generate_status"], self.server.state["generate_response"]
+        self._send(status, json.dumps(body).encode())
 
     def _send(self, status, body):
         self.send_response(status)
@@ -49,6 +56,7 @@ class MockOllama:
                 "eval_count": 4,
                 "done_reason": "stop",
             },
+            "generate_response_fn": None,
         }
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -67,6 +75,10 @@ class MockOllama:
     def set_generate_response(self, response: dict, status: int = 200) -> None:
         self.server.state["generate_response"] = response
         self.server.state["generate_status"] = status
+
+    def set_generate_response_fn(self, fn) -> None:
+        """Supply a callable(payload) -> response dict, for responses that vary per request."""
+        self.server.state["generate_response_fn"] = fn
 
     def shutdown(self) -> None:
         self.server.shutdown()

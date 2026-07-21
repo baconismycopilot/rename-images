@@ -8,10 +8,11 @@ dependencies = [
     "click>=8.4.2",
     "mlx-vlm>=0.6.5",
     "pillow>=12.3.0",
+    "pillow-heif>=1.4.0",
 ]
 
 [project.scripts]
-rename-images = "rename_images:main"
+rename-images = "rename_images:cli"
 
 [build-system]
 requires = ["hatchling"]
