@@ -170,7 +170,7 @@ See [CLAUDE.md](CLAUDE.md) for a deeper architectural walkthrough.
 
 ## Releasing
 
-Releases are tracked as GitHub Releases (Releases tab → tags), with notes auto-generated from merged PR titles rather than hand-written each time — grouped into categories by label via [`.github/release.yml`](.github/release.yml) (`enhancement` → New Features, `bug` → Bug Fixes, `documentation` → Documentation, everything else → Other Changes). Label PRs accordingly before cutting a release so they land in the right section.
+Releases are tracked as GitHub Releases (Releases tab → tags), with notes auto-generated from merged PR titles rather than hand-written each time — grouped into categories by label via [`.github/release.yml`](.github/release.yml) (`enhancement` → New Features, `bug` → Bug Fixes, `documentation` → Documentation, everything else → Other Changes). A workflow ([`.github/workflows/label-pr.yml`](.github/workflows/label-pr.yml)) applies these labels automatically from each PR's title (keywords like "fix"/"bug" → `bug`, "doc"/"readme"/"license" → `documentation`, otherwise `enhancement`), so there's nothing to remember before merging — it only skips PRs you've already labeled yourself.
 
 To cut one:
 

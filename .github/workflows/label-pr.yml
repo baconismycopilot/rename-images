@@ -1,0 +1,49 @@
+name: Label PR from title
+
+# Auto-applies one of the categories .github/release.yml groups release
+# notes by (enhancement/bug/documentation), so release notes stay
+# categorized without having to remember to label every PR by hand.
+# Runs again on title edits so a retitled PR gets re-evaluated. Never
+# overwrites a label you applied yourself — skips any PR that already
+# carries one of these three labels.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const managedLabels = ["bug", "enhancement", "documentation"];
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+
+            const alreadyLabeled = pr.labels.some((l) => managedLabels.includes(l.name));
+            if (alreadyLabeled) return;
+
+            const title = pr.title.toLowerCase();
+            let label;
+            if (/\b(fix|bug|hotfix|patch|resolve|correct)\b/.test(title)) {
+              label = "bug";
+            } else if (/\b(doc|docs|documentation|readme|license|changelog)\b/.test(title)) {
+              label = "documentation";
+            } else {
+              label = "enhancement";
+            }
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: [label],
+            });
