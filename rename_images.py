@@ -56,7 +56,11 @@ import base64
 import hashlib
 import io
 import json
+import os
+import platform
 import re
+import shutil
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -108,19 +112,51 @@ CACHE_FILENAME = ".rename-images-cache.json"
 CACHE_VERSION = 1
 
 DEFAULT_LOCAL_MODEL = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
-DEFAULT_REMOTE_MODEL = "qwen2.5vl:7b"
+DEFAULT_REMOTE_MODEL = "llava:13b"
+# Lighter fallback for the auto-selected local Ollama backend (see
+# _choose_ollama_default_model()) when this machine's own detected hardware
+# can't comfortably fit DEFAULT_REMOTE_MODEL.
+FALLBACK_REMOTE_MODEL = "qwen2.5vl:7b"
+DEFAULT_OLLAMA_URL = "http://localhost:11434"
 REMOTE_TIMEOUT_SECS = 120
 REMOTE_PREFLIGHT_TIMEOUT_SECS = 10
 
-REMOTE_SETUP_HELP = """\
+_OLLAMA_INSTALL_STEPS = (
+    "  1. Install Ollama:      curl -fsSL https://ollama.com/install.sh | sh\n"
+    "  2. Pull a vision model: ollama pull {model}"
+)
+
+REMOTE_SETUP_HELP = f"""\
 To set up a machine for offloaded inference:
-  1. Install Ollama:      curl -fsSL https://ollama.com/install.sh | sh
-  2. Pull a vision model: ollama pull {model}
+{_OLLAMA_INSTALL_STEPS}
   3. Make it reachable on the network (Ollama binds to localhost only by
      default), then (re)start it with that env var set:
        OLLAMA_HOST=0.0.0.0:11434 ollama serve
   4. Open port 11434 on that machine's firewall, if one is enabled.
 Then point this tool at it with -u http://<remote-host>:11434"""
+
+LOCAL_OLLAMA_SETUP_HELP = f"""\
+This platform doesn't run the local MLX backend (that's Apple Silicon
+only), so rename-images defaults to a local Ollama server instead:
+{_OLLAMA_INSTALL_STEPS}
+  3. Start it:            ollama serve
+Or offload to a different machine instead with -u http://<remote-host>:11434
+Run `rename-images models` for other vision-capable model options."""
+
+
+def is_apple_silicon() -> bool:
+    """True on an Apple Silicon Mac — the platform the local MLX backend is built for.
+
+    mlx-vlm technically installs on other platforms too (mlx ships manylinux
+    wheels), but this repo's local backend is designed and tuned for Apple
+    Silicon's GPU/Neural Engine specifically (see CLAUDE.md), and a Linux
+    install of mlx has no working backend behind it in practice. Everywhere
+    else, the local-by-default backend is Ollama running on this same
+    machine instead — see DEFAULT_OLLAMA_URL and rename_cmd's backend
+    selection.
+    """
+    return platform.system() == "Darwin" and platform.machine() == "arm64"
+
 
 PROMPT = (
     "Look at this image and suggest a short, descriptive filename for it. "
@@ -169,7 +205,9 @@ def _clean_exif_value(value):
     return value
 
 
-def _parse_exif(exif, include_maker_note: bool = False, include_user_comment: bool = False) -> dict:
+def _parse_exif(
+    exif, include_maker_note: bool = False, include_user_comment: bool = False
+) -> dict:
     """Flatten a PIL Exif object (base IFD + Exif and GPS sub-IFDs) into a JSON-safe dict."""
     data = {}
     for tag_id, value in exif.items():
@@ -187,7 +225,8 @@ def _parse_exif(exif, include_maker_note: bool = False, include_user_comment: bo
     gps = exif.get_ifd(ExifTags.IFD.GPSInfo)
     if gps:
         data["GPSInfo"] = {
-            _tag_name(ExifTags.GPS, tag_id): _clean_exif_value(value) for tag_id, value in gps.items()
+            _tag_name(ExifTags.GPS, tag_id): _clean_exif_value(value)
+            for tag_id, value in gps.items()
         }
 
     return data
@@ -209,10 +248,14 @@ def get_photo_metadata(
             exif = img.getexif()
             if exif:
                 exif_data = _parse_exif(
-                    exif, include_maker_note=include_maker_note, include_user_comment=include_user_comment
+                    exif,
+                    include_maker_note=include_maker_note,
+                    include_user_comment=include_user_comment,
                 )
                 exif_ifd = exif.get_ifd(ExifTags.IFD.Exif)
-                raw = exif_ifd.get(ExifTags.Base.DateTimeOriginal) or exif.get(ExifTags.Base.DateTime)
+                raw = exif_ifd.get(ExifTags.Base.DateTimeOriginal) or exif.get(
+                    ExifTags.Base.DateTime
+                )
                 if raw:
                     date = datetime.strptime(raw, "%Y:%m:%d %H:%M:%S")
     except Exception:
@@ -225,10 +268,14 @@ def get_photo_metadata(
     return date, exif_data
 
 
-def get_exif_data(path: Path, include_maker_note: bool = False, include_user_comment: bool = False) -> dict:
+def get_exif_data(
+    path: Path, include_maker_note: bool = False, include_user_comment: bool = False
+) -> dict:
     """Get just the EXIF dict for one image (used by the standalone `exif` command)."""
     return get_photo_metadata(
-        path, include_maker_note=include_maker_note, include_user_comment=include_user_comment
+        path,
+        include_maker_note=include_maker_note,
+        include_user_comment=include_user_comment,
     )[1]
 
 
@@ -267,7 +314,9 @@ def load_cache(folder: Path) -> dict:
     if cache_path.exists():
         try:
             data = json.loads(cache_path.read_text())
-            if data.get("version") == CACHE_VERSION and isinstance(data.get("entries"), dict):
+            if data.get("version") == CACHE_VERSION and isinstance(
+                data.get("entries"), dict
+            ):
                 return data
         except (json.JSONDecodeError, OSError):
             pass
@@ -284,28 +333,38 @@ class GenResult(NamedTuple):
     hit_limit: bool
 
 
-def check_remote_backend(remote_url: str, model_name: str) -> None:
-    """Fail fast with setup guidance if the remote Ollama server isn't reachable or ready.
+def check_remote_backend(
+    remote_url: str, model_name: str, is_local: bool = False
+) -> None:
+    """Fail fast with setup guidance if the Ollama server isn't reachable or ready.
 
-    Run once, right before the first image that actually needs the remote
+    Run once, right before the first image that actually needs the Ollama
     backend (not up front) — a run where every image is a cache hit never
-    needs to talk to the remote server at all.
+    needs to talk to it at all. `is_local` just selects which setup guidance
+    to print (localhost defaulted-to-Ollama vs. an explicit remote -u host)
+    — the actual check is identical either way.
     """
     tags_url = f"{remote_url.rstrip('/')}/api/tags"
     try:
-        with urllib.request.urlopen(tags_url, timeout=REMOTE_PREFLIGHT_TIMEOUT_SECS) as resp:
+        with urllib.request.urlopen(
+            tags_url, timeout=REMOTE_PREFLIGHT_TIMEOUT_SECS
+        ) as resp:
             data = json.loads(resp.read())
     except Exception as e:
         click.echo(f"Could not reach Ollama at {remote_url} ({e}).\n", err=True)
-        click.echo(REMOTE_SETUP_HELP.format(model=model_name), err=True)
+        help_text = LOCAL_OLLAMA_SETUP_HELP if is_local else REMOTE_SETUP_HELP
+        click.echo(help_text.format(model=model_name), err=True)
         sys.exit(1)
 
     available = {m.get("name") or m.get("model") for m in data.get("models", [])}
     if model_name not in available:
         click.echo(f"Model '{model_name}' is not pulled on {remote_url}.", err=True)
         if available:
-            click.echo(f"Models available there: {', '.join(sorted(available))}", err=True)
-        click.echo(f"\nOn that machine, run:\n  ollama pull {model_name}", err=True)
+            click.echo(
+                f"Models available there: {', '.join(sorted(available))}", err=True
+            )
+        where = "" if is_local else " on that machine"
+        click.echo(f"\nRun{where}:\n  ollama pull {model_name}", err=True)
         sys.exit(1)
 
 
@@ -330,10 +389,14 @@ def _remote_image_bytes(img_path: Path) -> bytes:
             img.save(buffer, format="JPEG", quality=90)
             return buffer.getvalue()
     except Exception as e:
-        raise RuntimeError(f"could not convert {img_path.suffix} to JPEG for the remote backend ({e})") from e
+        raise RuntimeError(
+            f"could not convert {img_path.suffix} to JPEG for the remote backend ({e})"
+        ) from e
 
 
-def generate_remote(remote_url: str, model_name: str, img_path: Path, max_tokens: int) -> GenResult:
+def generate_remote(
+    remote_url: str, model_name: str, img_path: Path, max_tokens: int
+) -> GenResult:
     """Caption an image via a remote Ollama server's /api/generate endpoint.
 
     HTTP is plain stdlib urllib — the only thing required on the remote
@@ -386,37 +449,67 @@ class DefaultGroup(click.Group):
         self.default_command = default_command
 
     def resolve_command(self, ctx, args):
-        if args and (args[0] in self.commands or args[0] in ("--help", "-h")):
+        if args and (
+            args[0] in self.commands or args[0] in ("--help", "-h", "--version")
+        ):
             return super().resolve_command(ctx, args)
         return super().resolve_command(ctx, [self.default_command, *args])
 
 
 @click.group(cls=DefaultGroup, default_command="rename")
+@click.version_option(package_name="rename-images", prog_name="rename-images")
 def cli():
     """Rename images by their content (default), or inspect their EXIF data."""
 
 
 @cli.command("rename")
-@click.argument("folder", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path))
-@click.option("-a", "--apply", is_flag=True, help="Actually rename files (default is dry-run)")
+@click.argument(
+    "folder",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+)
+@click.option(
+    "-a", "--apply", is_flag=True, help="Actually rename files (default is dry-run)"
+)
 @click.option("-r", "--recursive", is_flag=True, help="Recurse into subfolders")
 @click.option(
     "-m",
     "--model",
     "model_name",
     default=None,
-    help=f"Model to use. Defaults to {DEFAULT_LOCAL_MODEL!r} locally, "
-    f"or {DEFAULT_REMOTE_MODEL!r} when -u/--remote-url is set.",
+    help=f"Model to use. Defaults to {DEFAULT_LOCAL_MODEL!r} on local MLX (Apple Silicon), "
+    f"or {DEFAULT_REMOTE_MODEL!r} on Ollama (explicit -u/--remote-url, or the auto-selected "
+    "local Ollama backend on other platforms — where it's downgraded to "
+    f"{FALLBACK_REMOTE_MODEL!r} if this machine's detected hardware can't fit it). Run "
+    "`rename-images models` to see other options.",
 )
-@click.option("-t", "--max-tokens", type=int, default=30, show_default=True, help="Max tokens for the model's response")
-@click.option("-v", "--verbose", is_flag=True, help="Print tokens generated per image (useful for tuning --max-tokens)")
-@click.option("-c", "--no-cache", is_flag=True, help="Ignore/skip the description cache and re-run inference on every image")
+@click.option(
+    "-t",
+    "--max-tokens",
+    type=int,
+    default=30,
+    show_default=True,
+    help="Max tokens for the model's response",
+)
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Print tokens generated per image (useful for tuning --max-tokens)",
+)
+@click.option(
+    "-c",
+    "--no-cache",
+    is_flag=True,
+    help="Ignore/skip the description cache and re-run inference on every image",
+)
 @click.option(
     "-u",
     "--remote-url",
     default=None,
-    help="Offload inference to an Ollama server at this base URL (e.g. http://192.168.1.50:11434) "
-    "instead of running MLX locally",
+    help="Ollama server base URL (e.g. http://192.168.1.50:11434) to send inference to. "
+    "Defaults to local MLX on Apple Silicon; on other platforms (Linux, Windows, Intel "
+    "Mac), where MLX doesn't apply, defaults to a local Ollama server at "
+    f"{DEFAULT_OLLAMA_URL} instead — pass this to point at a different machine.",
 )
 @click.option(
     "-w",
@@ -439,26 +532,61 @@ def rename_cmd(
     workers: int,
 ):
     """Rename images based on their content using a vision model, local or remote."""
-    if model_name is None:
-        model_name = DEFAULT_REMOTE_MODEL if remote_url else DEFAULT_LOCAL_MODEL
+    # Platform-based backend selection: MLX only runs (well) on Apple
+    # Silicon (see is_apple_silicon()), so everywhere else defaults to a
+    # local Ollama server instead of trying to load MLX at all. An explicit
+    # -u/--remote-url always wins, on any platform, same as before.
+    auto_local_ollama = False
+    if remote_url is None and not is_apple_silicon():
+        remote_url = DEFAULT_OLLAMA_URL
+        auto_local_ollama = True
 
     images = list(find_images(folder, recursive))
     if not images:
         click.echo("No images found.")
         return
 
-    cache = {"version": CACHE_VERSION, "entries": {}} if no_cache else load_cache(folder)
+    # Resolving the default model can shell out to nvidia-smi/sysctl (see
+    # _choose_ollama_default_model -> _detect_hardware), so this waits until
+    # after the no-images early return above rather than paying for that
+    # subprocess call on a run that's about to do nothing anyway.
+    auto_model_downgraded = False
+    if model_name is None:
+        if remote_url:
+            model_name = _choose_ollama_default_model(auto_local_ollama)
+            auto_model_downgraded = model_name != DEFAULT_REMOTE_MODEL
+        else:
+            model_name = DEFAULT_LOCAL_MODEL
+
+    cache = (
+        {"version": CACHE_VERSION, "entries": {}} if no_cache else load_cache(folder)
+    )
     cache_dirty = False
 
     # EXIF/file-date lookups are I/O-bound and independent per image, so kick
     # them off on a thread pool now — they run alongside the (I/O-heavy)
     # model load below and are essentially free by the time we need them.
     date_pool = ThreadPoolExecutor()
-    metadata_futures = {img_path: date_pool.submit(get_photo_metadata, img_path) for img_path in images}
+    metadata_futures = {
+        img_path: date_pool.submit(get_photo_metadata, img_path) for img_path in images
+    }
 
-    backend = f"remote ({remote_url})" if remote_url else "local MLX"
+    if remote_url:
+        backend = (
+            f"local Ollama ({remote_url})"
+            if auto_local_ollama
+            else f"remote Ollama ({remote_url})"
+        )
+    else:
+        backend = "local MLX"
     mode = "APPLYING RENAMES" if apply else "DRY RUN (use --apply to actually rename)"
     click.echo(f"Found {len(images)} image(s). Backend: {backend}. Mode: {mode}\n")
+    if auto_model_downgraded:
+        click.echo(
+            f"Note: default model {DEFAULT_REMOTE_MODEL!r} may not fit this machine's "
+            f"detected hardware; using {model_name!r} instead. Run `rename-images models` "
+            "for details.\n"
+        )
 
     # The cache is namespaced by backend + model so switching between them
     # (or pointing -u at a different server) can't silently reuse a
@@ -500,10 +628,12 @@ def rename_cmd(
     if remote_url:
         misses = [img_path for img_path in images if not is_cache_hit(img_path)]
         if misses:
-            check_remote_backend(remote_url, model_name)
+            check_remote_backend(remote_url, model_name, is_local=auto_local_ollama)
             with ThreadPoolExecutor(max_workers=workers) as remote_pool:
                 futures = {
-                    img_path: remote_pool.submit(generate_remote, remote_url, model_name, img_path, max_tokens)
+                    img_path: remote_pool.submit(
+                        generate_remote, remote_url, model_name, img_path, max_tokens
+                    )
                     for img_path in misses
                 }
                 # Reported here (in submission order, blocking per image as
@@ -516,13 +646,17 @@ def rename_cmd(
                     try:
                         result = future.result()
                     except Exception as e:
-                        click.echo(f"{prefix} [SKIP] {img_path.name}: remote error ({e})")
+                        click.echo(
+                            f"{prefix} [SKIP] {img_path.name}: remote error ({e})"
+                        )
                         failed_images.add(img_path)
                         continue
                     remote_results[img_path] = result
                     progress = f"{prefix} {img_path.name}"
                     if verbose and result.tokens is not None:
-                        hit_limit = " (hit --max-tokens limit)" if result.hit_limit else ""
+                        hit_limit = (
+                            " (hit --max-tokens limit)" if result.hit_limit else ""
+                        )
                         progress += f": {result.tokens} tokens{hit_limit}"
                     click.echo(progress)
 
@@ -560,11 +694,17 @@ def rename_cmd(
                     model, processor = load(model_name)
                     config = load_config(model_name)
 
-                formatted_prompt = apply_chat_template(processor, config, PROMPT, num_images=1)
+                formatted_prompt = apply_chat_template(
+                    processor, config, PROMPT, num_images=1
+                )
                 try:
                     response = generate(
-                        model, processor, formatted_prompt, [str(img_path)],
-                        max_tokens=max_tokens, verbose=False,
+                        model,
+                        processor,
+                        formatted_prompt,
+                        [str(img_path)],
+                        max_tokens=max_tokens,
+                        verbose=False,
                     )
                     # mlx-vlm's generate() may return a string or an object with .text
                     text = response.text if hasattr(response, "text") else str(response)
@@ -591,7 +731,11 @@ def rename_cmd(
                 # filename instead of a near-meaningless one-word slug.
                 desc = img_path.stem
 
-            cache["entries"][rel_key] = {"checksum": checksum, "model": cache_model_key, "desc": desc}
+            cache["entries"][rel_key] = {
+                "checksum": checksum,
+                "model": cache_model_key,
+                "desc": desc,
+            }
             cache_dirty = True
 
         # Keep the cached EXIF dict current regardless of whether desc was a
@@ -631,7 +775,15 @@ def rename_cmd(
         save_cache(folder, cache)
 
     if not apply:
-        click.echo("\nNo files were changed (dry run). Re-run with --apply to rename them.")
+        click.echo(
+            "\nNo files were changed (dry run). Re-run with --apply to rename them."
+        )
+
+
+def _col_width(values) -> int:
+    """Widest string in values — shared by every command that hand-rolls an aligned table,
+    since ANSI-colored output needs widths computed from plain text before any styling."""
+    return max(len(v) for v in values)
 
 
 def _table_rows(data: dict, prefix: str = "") -> list[tuple[str, object]]:
@@ -645,9 +797,322 @@ def _table_rows(data: dict, prefix: str = "") -> list[tuple[str, object]]:
     return rows
 
 
+class ModelInfo(NamedTuple):
+    name: str
+    params: str
+    requirement_gb: float  # rough rule-of-thumb RAM/VRAM needed, not a guarantee
+    notes: str
+
+
+class HardwareInfo(NamedTuple):
+    ecosystem: str
+    models: list[ModelInfo]
+    capacity: float | None
+    summary: str
+
+
+# mlx-community repo IDs for the local Apple Silicon backend. Same lineup as
+# CLAUDE.md's "Model options" table; requirement_gb is unified memory, not
+# VRAM, since Apple Silicon shares one pool between CPU and GPU.
+MLX_MODELS = [
+    ModelInfo(
+        "mlx-community/Qwen2-VL-2B-Instruct-4bit",
+        "2B, 4-bit",
+        4,
+        "Default — good balance of caption quality and speed; the most battle-tested small "
+        "model in the mlx-vlm ecosystem",
+    ),
+    ModelInfo(
+        "mlx-community/Qwen2.5-VL-3B-Instruct-4bit",
+        "3B, 4-bit",
+        5,
+        "Better instruction-following than Qwen2-VL for strict 'N words only' prompts",
+    ),
+    ModelInfo(
+        "mlx-community/SmolVLM-Instruct-4bit",
+        "~2.2B, 4-bit",
+        4,
+        "Comparable size to the default; weaker instruction-following on structured/short-output "
+        "prompts",
+    ),
+    ModelInfo(
+        "mlx-community/Qwen2-VL-7B-Instruct-4bit",
+        "7B, 4-bit",
+        8,
+        "Noticeably better scene understanding for cluttered/ambiguous photos; slower, ~4-5GB "
+        "download",
+    ),
+]
+
+# Ollama tags for the (auto-selected-on-non-Apple-Silicon, or explicit -u)
+# Ollama backend. requirement_gb is GPU VRAM if there's an NVIDIA GPU,
+# otherwise system RAM for CPU-only inference (much slower either way).
+OLLAMA_MODELS = [
+    ModelInfo(
+        "moondream",
+        "~1.8B",
+        2,
+        "Tiny and fast; a reasonable choice for CPU-only or very limited VRAM, weaker on "
+        "complex/cluttered scenes",
+    ),
+    ModelInfo("qwen2.5vl:3b", "3B", 4, "Good balance for low-VRAM GPUs"),
+    ModelInfo("llava:7b", "7B", 6, "Widely used, decent general-purpose captioning"),
+    ModelInfo(
+        "qwen2.5vl:7b",
+        "7B",
+        6,
+        "Strong instruction-following for short captions, but see llava:13b below — "
+        "real-world testing found it noticeably better for this tool's task",
+    ),
+    ModelInfo("minicpm-v", "8B", 7, "Strong OCR/fine-detail recognition"),
+    ModelInfo(
+        "llava:13b",
+        "13B",
+        10,
+        "This tool's default Ollama model — real-world testing found its captions "
+        "noticeably better than the smaller 7b-class tags, likely because LLaVA's "
+        "training is purpose-built for open-ended scene description; needs more VRAM",
+    ),
+    ModelInfo("qwen2.5vl:32b", "32B", 24, "High quality; requires a serious GPU"),
+    ModelInfo("llava:34b", "34B", 26, "High quality; requires a serious GPU"),
+]
+
+
+def _run_command_stdout(cmd: list[str]) -> str | None:
+    """Run cmd and return its stripped stdout, or None on any failure (missing binary,
+    non-zero exit, timeout) — the shared shape behind every best-effort hardware probe below."""
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=True)
+        return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _detect_apple_memory_gb() -> float | None:
+    """Best-effort unified memory size on an Apple Silicon Mac, via sysctl."""
+    stdout = _run_command_stdout(["sysctl", "-n", "hw.memsize"])
+    if stdout is None:
+        return None
+    try:
+        return int(stdout) / (1024**3)
+    except ValueError:
+        return None
+
+
+def _detect_nvidia_vram_gb() -> float | None:
+    """Best-effort VRAM of the largest NVIDIA GPU, via nvidia-smi; None if absent/unavailable.
+
+    On a multi-GPU machine, Ollama runs a given model on a single GPU unless
+    explicitly configured for multi-GPU tensor-split, so the largest card's
+    VRAM is a better capacity estimate than the sum (which would overstate
+    what a single model load can actually use) or just the first line's
+    value (which is arbitrary — device enumeration order isn't tied to size).
+    """
+    if not shutil.which("nvidia-smi"):
+        return None
+    stdout = _run_command_stdout(
+        ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"]
+    )
+    if stdout is None:
+        return None
+    try:
+        mib_per_gpu = [
+            int(line.strip()) for line in stdout.splitlines() if line.strip()
+        ]
+        if not mib_per_gpu:
+            return None
+        return max(mib_per_gpu) / 1024  # MiB -> GB
+    except ValueError:
+        return None
+
+
+def _detect_system_ram_gb() -> float | None:
+    """Best-effort total system RAM for platforms/cases with no detected GPU.
+
+    os.sysconf isn't available on Windows, hence the broad except.
+    """
+    try:
+        return (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024**3)
+    except (ValueError, AttributeError, OSError):
+        return None
+
+
+def _format_gb(value: float) -> str:
+    """Render a detected capacity in GB, e.g. '16 GB'.
+
+    The single place every hardware-summary string below formats a capacity
+    figure, so a future precision/unit tweak can't land on only some of them.
+    """
+    return f"{value:.0f} GB"
+
+
+def _detect_hardware() -> HardwareInfo:
+    """Pick a model catalog for this machine and describe/size its detected hardware.
+
+    Capacity is unified memory on Apple Silicon, GPU VRAM if an NVIDIA GPU is
+    found elsewhere, or system RAM as a last resort for CPU-only inference —
+    whichever applies is None if it couldn't be detected at all, in which
+    case every model's fit is unknown rather than guessed.
+    """
+    if is_apple_silicon():
+        capacity = _detect_apple_memory_gb()
+        summary = (
+            f"Apple Silicon Mac — unified memory: {_format_gb(capacity)}"
+            if capacity is not None
+            else "Apple Silicon Mac (unified memory unknown)"
+        )
+        return HardwareInfo("MLX (local, Apple Silicon)", MLX_MODELS, capacity, summary)
+
+    vram = _detect_nvidia_vram_gb()
+    if vram is not None:
+        summary = f"{platform.system()} with an NVIDIA GPU — VRAM: {_format_gb(vram)} (via nvidia-smi)"
+        return HardwareInfo("Ollama", OLLAMA_MODELS, vram, summary)
+
+    ram = _detect_system_ram_gb()
+    summary = (
+        f"{platform.system()}, no NVIDIA GPU detected — CPU-only inference will be slow"
+    )
+    summary += (
+        f"; system RAM: {_format_gb(ram)}" if ram is not None else " (RAM unknown)"
+    )
+    return HardwareInfo("Ollama", OLLAMA_MODELS, ram, summary)
+
+
+def _fit(capacity: float | None, requirement_gb: float) -> str:
+    """Rough 'will this model fit' verdict — a heuristic, not a guarantee (KV cache, other
+    processes, and quantization overhead all vary), which is why the tight/no bands only shave
+    a fixed fraction off the raw requirement."""
+    if capacity is None:
+        return "?"
+    if capacity >= requirement_gb:
+        return "yes"
+    if capacity >= requirement_gb * 0.75:
+        return "tight"
+    return "no"
+
+
+def _best_match_name(rows: list[dict]) -> str | None:
+    """The largest catalog model that comfortably fits detected hardware, or None if none do.
+
+    "Largest that fits" rather than "smallest that fits": within a hardware budget, a bigger
+    model is generally the better caption quality, so this picks the most capable one that
+    doesn't require guessing (a "tight" fit is deliberately not eligible here).
+    """
+    fitting = [r for r in rows if r["fits"] == "yes"]
+    if not fitting:
+        return None
+    return max(fitting, key=lambda r: r["approx_gb_needed"])["name"]
+
+
+def _fit_color(fit: str, is_best_match: bool) -> str | None:
+    """Map a model row's fit verdict (+ whether it's the best match) to a click.style() color."""
+    if is_best_match:
+        return "green"
+    if fit == "no":
+        return "red"
+    return None
+
+
+def _choose_ollama_default_model(is_local: bool) -> str:
+    """Pick the default Ollama model tag, downgrading if this machine's hardware can't fit it.
+
+    Only kicks in for the auto-selected local Ollama backend (`is_local=True`, i.e.
+    rename_cmd()'s `auto_local_ollama`) — this machine's own detected RAM/VRAM is only a
+    meaningful signal when this machine is what actually runs inference. Any explicit -u,
+    including one that happens to point at localhost, is treated as `is_local=False` and
+    skips this check entirely: there's no reliable way to tell "the user pointed at their
+    own loopback interface" apart from "the user pointed at a genuinely different host", and
+    check_remote_backend()'s preflight check already catches an unpulled/oversized model
+    there with actionable guidance — a simple, predictable rule (explicit -u is never
+    second-guessed) beats guessing at the host's identity from the URL string.
+    """
+    if not is_local:
+        return DEFAULT_REMOTE_MODEL
+    capacity = _detect_hardware().capacity
+    requirement = next(
+        (m.requirement_gb for m in OLLAMA_MODELS if m.name == DEFAULT_REMOTE_MODEL),
+        None,
+    )
+    # requirement is only None if DEFAULT_REMOTE_MODEL and OLLAMA_MODELS have
+    # drifted apart (e.g. the default was retagged without updating the
+    # catalog) — treat that like an unknown/undetectable fit rather than
+    # crashing: keep the configured default rather than guess at a downgrade.
+    if requirement is not None and _fit(capacity, requirement) == "no":
+        return FALLBACK_REMOTE_MODEL
+    return DEFAULT_REMOTE_MODEL
+
+
+@cli.command("models")
+@click.option(
+    "-f",
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    show_default=True,
+    help="Output format",
+)
+def models_cmd(output_format: str):
+    """List popular vision-capable models for the backend/hardware detected on this machine."""
+    hw = _detect_hardware()
+    rows = [
+        {
+            "name": m.name,
+            "params": m.params,
+            "approx_gb_needed": m.requirement_gb,
+            "fits": _fit(hw.capacity, m.requirement_gb),
+            "notes": m.notes,
+        }
+        for m in hw.models
+    ]
+    best_match = _best_match_name(rows)
+    for r in rows:
+        r["best_match"] = r["name"] == best_match
+
+    if output_format == "json":
+        click.echo(
+            json.dumps(
+                {"hardware": hw.summary, "ecosystem": hw.ecosystem, "models": rows},
+                indent=2,
+            )
+        )
+        return
+
+    click.echo(f"Detected: {hw.summary}")
+    click.echo(f"Ecosystem: {hw.ecosystem}\n")
+    if hw.capacity is None:
+        click.echo(
+            "(Couldn't detect capacity, so the fit column is unknown for every model below.)\n"
+        )
+
+    # Width/alignment must be computed from the plain (unstyled) text: ANSI
+    # escape codes are invisible but still count toward str length, so
+    # styling before padding would misalign every colored row.
+    name_w = _col_width(r["name"] for r in rows)
+    params_w = _col_width(r["params"] for r in rows)
+    for r in rows:
+        req = f"~{r['approx_gb_needed']:.0f}GB"
+        line = (
+            f"  {r['name']:<{name_w}}  {r['params']:<{params_w}}  {req:>6}  "
+            f"fits:{r['fits']:<5}  {r['notes']}"
+        )
+        color = _fit_color(r["fits"], r["best_match"])
+        click.echo(click.style(line, fg=color) if color else line)
+
+    click.echo(
+        "\nRAM/VRAM figures are rough rules of thumb (quantized model size plus overhead), not "
+        "guarantees. Best-fit recommendation shown in green; models unlikely to fit shown in red."
+    )
+
+
 @cli.command("exif")
 @click.argument("path", type=click.Path(exists=True, path_type=Path))
-@click.option("-r", "--recursive", is_flag=True, help="Recurse into subfolders when PATH is a directory")
+@click.option(
+    "-r",
+    "--recursive",
+    is_flag=True,
+    help="Recurse into subfolders when PATH is a directory",
+)
 @click.option(
     "-f",
     "--format",
@@ -692,7 +1157,9 @@ def exif_cmd(
 
     results = {
         str(img_path.relative_to(root)): get_exif_data(
-            img_path, include_maker_note=include_maker_note, include_user_comment=include_user_comment
+            img_path,
+            include_maker_note=include_maker_note,
+            include_user_comment=include_user_comment,
         )
         for img_path in images
     }
@@ -709,7 +1176,7 @@ def exif_cmd(
         if not rows:
             click.echo("  (no EXIF data)")
             continue
-        width = max(len(tag) for tag, _ in rows)
+        width = _col_width(tag for tag, _ in rows)
         for tag, value in rows:
             click.echo(f"  {tag:<{width}}  {value}")
 

@@ -116,7 +116,9 @@ def test_load_cache_ignores_corrupt_json(tmp_path):
 
 
 def test_load_cache_ignores_version_mismatch(tmp_path):
-    (tmp_path / ri.CACHE_FILENAME).write_text(json.dumps({"version": 999, "entries": {"a": {}}}))
+    (tmp_path / ri.CACHE_FILENAME).write_text(
+        json.dumps({"version": 999, "entries": {"a": {}}})
+    )
     assert ri.load_cache(tmp_path) == {"version": ri.CACHE_VERSION, "entries": {}}
 
 
@@ -241,7 +243,9 @@ def test_get_photo_metadata_reads_heic_exif_date(tmp_path):
     path = tmp_path / "photo.heic"
     img = Image.new("RGB", (8, 4), color="red")
     exif = img.getexif()
-    exif.get_ifd(ExifTags.IFD.Exif)[ExifTags.Base.DateTimeOriginal] = "2023:05:01 12:00:00"
+    exif.get_ifd(ExifTags.IFD.Exif)[ExifTags.Base.DateTimeOriginal] = (
+        "2023:05:01 12:00:00"
+    )
     _make_heic_image(path, exif=exif)
 
     date, exif_data = ri.get_photo_metadata(path)
@@ -266,13 +270,15 @@ def test_generate_remote_sends_transcoded_jpeg_for_heic(tmp_path, mock_ollama):
 
 def test_cli_renames_heic_via_remote_backend(tmp_path, mock_ollama):
     """End-to-end: a HEIC file must reach the remote backend as JPEG and get a date-prefixed slug name."""
-    mock_ollama.set_models(["qwen2.5vl:7b"])
+    mock_ollama.set_models([ri.DEFAULT_REMOTE_MODEL])
     mock_ollama.set_generate_response(
         {"response": "a red rectangle", "eval_count": 3, "done_reason": "stop"}
     )
     img = Image.new("RGB", (8, 4), color="red")
     exif = img.getexif()
-    exif.get_ifd(ExifTags.IFD.Exif)[ExifTags.Base.DateTimeOriginal] = "2023:05:01 12:00:00"
+    exif.get_ifd(ExifTags.IFD.Exif)[ExifTags.Base.DateTimeOriginal] = (
+        "2023:05:01 12:00:00"
+    )
     _make_heic_image(tmp_path / "IMG_0173.heic", exif=exif)
 
     result = CliRunner().invoke(ri.cli, [str(tmp_path), "-u", mock_ollama.url, "-a"])
@@ -331,11 +337,230 @@ def test_check_remote_backend_exits_when_unreachable(capsys):
     assert "Could not reach Ollama" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "is_local, expect_present, expect_absent",
+    [
+        (True, "defaults to a local Ollama server", "OLLAMA_HOST=0.0.0.0"),
+        (False, "OLLAMA_HOST=0.0.0.0", None),
+    ],
+)
+def test_check_remote_backend_help_when_unreachable(
+    capsys, is_local, expect_present, expect_absent
+):
+    with pytest.raises(SystemExit):
+        ri.check_remote_backend("http://127.0.0.1:1", "qwen2.5vl:7b", is_local=is_local)
+
+    err = capsys.readouterr().err
+    assert expect_present in err
+    if expect_absent:
+        assert expect_absent not in err
+
+
+# ---------- platform-based backend selection ----------
+
+
+@pytest.mark.parametrize(
+    "system, machine, expected",
+    [
+        ("Darwin", "arm64", True),
+        ("Linux", "x86_64", False),
+        ("Darwin", "x86_64", False),
+    ],
+)
+def test_is_apple_silicon(monkeypatch, system, machine, expected):
+    monkeypatch.setattr(ri.platform, "system", lambda: system)
+    monkeypatch.setattr(ri.platform, "machine", lambda: machine)
+    assert ri.is_apple_silicon() is expected
+
+
+def test_cli_defaults_to_local_ollama_on_non_apple_silicon(
+    tmp_path, mock_ollama, monkeypatch
+):
+    """Without -u, a non-Apple-Silicon platform should hit local Ollama, never MLX."""
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(ri, "DEFAULT_OLLAMA_URL", mock_ollama.url)
+    mock_ollama.set_models([ri.DEFAULT_REMOTE_MODEL])
+    mock_ollama.set_generate_response(
+        {"response": "a red square", "eval_count": 3, "done_reason": "stop"}
+    )
+    img = tmp_path / "photo.jpg"
+    _make_image(img)
+
+    result = CliRunner().invoke(ri.cli, [str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert f"Backend: local Ollama ({mock_ollama.url})" in result.output
+    assert mock_ollama.generate_call_count == 1
+
+
+def test_cli_explicit_remote_url_overrides_auto_local_ollama_label(
+    tmp_path, mock_ollama, monkeypatch
+):
+    """An explicit -u always wins, and is labeled 'remote', even on a non-Apple-Silicon platform."""
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+    mock_ollama.set_models([ri.DEFAULT_REMOTE_MODEL])
+    mock_ollama.set_generate_response(
+        {"response": "a red square", "eval_count": 3, "done_reason": "stop"}
+    )
+    img = tmp_path / "photo.jpg"
+    _make_image(img)
+
+    result = CliRunner().invoke(ri.cli, [str(tmp_path), "-u", mock_ollama.url])
+
+    assert result.exit_code == 0
+    assert f"Backend: remote Ollama ({mock_ollama.url})" in result.output
+
+
+def test_cli_apple_silicon_defaults_to_local_mlx_label(tmp_path, monkeypatch):
+    """A cache hit means MLX never actually has to load, so this only checks label/selection."""
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: True)
+    img = tmp_path / "photo.jpg"
+    _make_image(img)
+    cache = {
+        "version": ri.CACHE_VERSION,
+        "entries": {
+            "photo.jpg": {
+                "checksum": ri.file_checksum(img),
+                "model": f"local:{ri.DEFAULT_LOCAL_MODEL}",
+                "desc": "cached-desc",
+            }
+        },
+    }
+    (tmp_path / ri.CACHE_FILENAME).write_text(json.dumps(cache))
+
+    result = CliRunner().invoke(ri.cli, [str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert "Backend: local MLX" in result.output
+
+
+# ---------- default-model hardware fallback ----------
+
+
+def test_choose_ollama_default_model_stays_default_when_it_fits(monkeypatch):
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: 24.0)
+    assert ri._choose_ollama_default_model(is_local=True) == ri.DEFAULT_REMOTE_MODEL
+
+
+def test_choose_ollama_default_model_downgrades_when_it_does_not_fit(monkeypatch):
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: 4.0)
+    monkeypatch.setattr(ri, "_detect_system_ram_gb", lambda: None)
+    assert ri._choose_ollama_default_model(is_local=True) == ri.FALLBACK_REMOTE_MODEL
+
+
+def test_choose_ollama_default_model_ignores_local_hardware_for_explicit_remote(
+    monkeypatch,
+):
+    """A genuinely remote -u host's capacity isn't this machine's to guess at."""
+    monkeypatch.setattr(
+        ri, "_detect_nvidia_vram_gb", lambda: 0.1
+    )  # would downgrade if consulted
+    assert ri._choose_ollama_default_model(is_local=False) == ri.DEFAULT_REMOTE_MODEL
+
+
+def test_choose_ollama_default_model_survives_catalog_drift(monkeypatch):
+    """If DEFAULT_REMOTE_MODEL and OLLAMA_MODELS ever drift apart, don't crash — keep the default."""
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(ri, "DEFAULT_REMOTE_MODEL", "some-model-not-in-catalog")
+    monkeypatch.setattr(
+        ri, "_detect_nvidia_vram_gb", lambda: 0.1
+    )  # would downgrade if consulted and found
+    assert ri._choose_ollama_default_model(is_local=True) == "some-model-not-in-catalog"
+
+
+def test_cli_downgrades_default_model_when_local_hardware_cant_fit_it(
+    tmp_path, mock_ollama, monkeypatch
+):
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(ri, "DEFAULT_OLLAMA_URL", mock_ollama.url)
+    monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: 4.0)
+    monkeypatch.setattr(ri, "_detect_system_ram_gb", lambda: None)
+    mock_ollama.set_models([ri.FALLBACK_REMOTE_MODEL])
+    mock_ollama.set_generate_response(
+        {"response": "a red square", "eval_count": 3, "done_reason": "stop"}
+    )
+    img = tmp_path / "photo.jpg"
+    _make_image(img)
+
+    result = CliRunner().invoke(ri.cli, [str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert f"using {ri.FALLBACK_REMOTE_MODEL!r} instead" in result.output
+    assert (
+        mock_ollama.server.state["generate_calls"][0]["model"]
+        == ri.FALLBACK_REMOTE_MODEL
+    )
+
+
+def test_cli_keeps_default_model_when_local_hardware_fits_it(
+    tmp_path, mock_ollama, monkeypatch
+):
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(ri, "DEFAULT_OLLAMA_URL", mock_ollama.url)
+    monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: 24.0)
+    mock_ollama.set_models([ri.DEFAULT_REMOTE_MODEL])
+    mock_ollama.set_generate_response(
+        {"response": "a red square", "eval_count": 3, "done_reason": "stop"}
+    )
+    img = tmp_path / "photo.jpg"
+    _make_image(img)
+
+    result = CliRunner().invoke(ri.cli, [str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert "Note: default model" not in result.output
+    assert (
+        mock_ollama.server.state["generate_calls"][0]["model"]
+        == ri.DEFAULT_REMOTE_MODEL
+    )
+
+
+def test_cli_does_not_downgrade_for_explicit_remote_host(
+    tmp_path, mock_ollama, monkeypatch
+):
+    """This machine's own (tiny) hardware must not override an explicit, genuinely remote -u host."""
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: 0.5)
+    mock_ollama.set_models([ri.DEFAULT_REMOTE_MODEL])
+    mock_ollama.set_generate_response(
+        {"response": "a red square", "eval_count": 3, "done_reason": "stop"}
+    )
+    img = tmp_path / "photo.jpg"
+    _make_image(img)
+
+    result = CliRunner().invoke(ri.cli, [str(tmp_path), "-u", mock_ollama.url])
+
+    assert result.exit_code == 0
+    assert "Note: default model" not in result.output
+    assert (
+        mock_ollama.server.state["generate_calls"][0]["model"]
+        == ri.DEFAULT_REMOTE_MODEL
+    )
+
+
 # ---------- CLI ----------
 
 
 def test_cli_reports_no_images(tmp_path):
     result = CliRunner().invoke(ri.cli, [str(tmp_path)])
+    assert result.exit_code == 0
+    assert "No images found." in result.output
+
+
+def test_cli_skips_hardware_detection_when_no_images_found(tmp_path, monkeypatch):
+    """An empty folder must not pay for a hardware-detection subprocess call it'll never use."""
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+
+    def _fail_if_called():
+        raise AssertionError("hardware detection should not run on an empty folder")
+
+    monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: _fail_if_called())
+    monkeypatch.setattr(ri, "_detect_system_ram_gb", lambda: _fail_if_called())
+
+    result = CliRunner().invoke(ri.cli, [str(tmp_path)])
+
     assert result.exit_code == 0
     assert "No images found." in result.output
 
@@ -353,8 +578,22 @@ def test_cli_explicit_rename_subcommand_also_works(tmp_path):
     assert "No images found." in result.output
 
 
+def test_cli_version_flag_prints_version_and_exits(tmp_path):
+    """--version must reach the group's own option, not get redirected to the default
+    'rename' subcommand and treated as a (nonexistent) folder argument."""
+    result = CliRunner().invoke(ri.cli, ["--version"])
+    assert result.exit_code == 0
+    assert "version" in result.output.lower()
+
+
+def test_cli_help_lists_version_option(tmp_path):
+    result = CliRunner().invoke(ri.cli, ["--help"])
+    assert result.exit_code == 0
+    assert "--version" in result.output
+
+
 def test_cli_dry_run_then_apply_reuses_cache_over_remote_backend(tmp_path, mock_ollama):
-    mock_ollama.set_models(["qwen2.5vl:7b"])
+    mock_ollama.set_models([ri.DEFAULT_REMOTE_MODEL])
     mock_ollama.set_generate_response(
         {"response": "a red square", "eval_count": 3, "done_reason": "stop"}
     )
@@ -379,7 +618,7 @@ def test_cli_dry_run_then_apply_reuses_cache_over_remote_backend(tmp_path, mock_
 
 def test_cli_workers_maps_concurrent_results_to_correct_images(tmp_path, mock_ollama):
     """With -w > 1, results must still land on the right image, not get mixed up across threads."""
-    mock_ollama.set_models(["qwen2.5vl:7b"])
+    mock_ollama.set_models([ri.DEFAULT_REMOTE_MODEL])
 
     # Distinguishable-by-size "images" (generate_remote() just reads+b64-encodes
     # raw bytes, so these don't need to be real images) — the mock server keys
@@ -394,16 +633,23 @@ def test_cli_workers_maps_concurrent_results_to_correct_images(tmp_path, mock_ol
 
     expected_desc = {name: f"desc for {name}" for name in contents}
     b64len_to_desc = {
-        len(base64.b64encode(content)): expected_desc[name] for name, content in contents.items()
+        len(base64.b64encode(content)): expected_desc[name]
+        for name, content in contents.items()
     }
 
     def response_fn(payload):
         b64len = len(payload["images"][0])
-        return {"response": b64len_to_desc[b64len], "eval_count": 1, "done_reason": "stop"}
+        return {
+            "response": b64len_to_desc[b64len],
+            "eval_count": 1,
+            "done_reason": "stop",
+        }
 
     mock_ollama.set_generate_response_fn(response_fn)
 
-    result = CliRunner().invoke(ri.cli, [str(tmp_path), "-u", mock_ollama.url, "-w", "3"])
+    result = CliRunner().invoke(
+        ri.cli, [str(tmp_path), "-u", mock_ollama.url, "-w", "3"]
+    )
 
     assert result.exit_code == 0
     assert mock_ollama.generate_call_count == 3
@@ -411,27 +657,37 @@ def test_cli_workers_maps_concurrent_results_to_correct_images(tmp_path, mock_ol
         assert f"{name}  ->" in result.output
         expected_slug = ri.slugify(expected_desc[name])
         # each image's own line must contain its own description, not another's
-        line = next(line_ for line_ in result.output.splitlines() if line_.strip().startswith(name))
+        line = next(
+            line_
+            for line_ in result.output.splitlines()
+            if line_.strip().startswith(name)
+        )
         assert expected_slug in line
 
 
 def test_cli_workers_reports_progress_as_requests_complete(tmp_path, mock_ollama):
     """Regression test: results must be reported as they complete, not only after the whole batch finishes."""
-    mock_ollama.set_models(["qwen2.5vl:7b"])
+    mock_ollama.set_models([ri.DEFAULT_REMOTE_MODEL])
     for name in ("a.jpg", "b.jpg", "c.jpg"):
         (tmp_path / name).write_bytes(name.encode())
-    mock_ollama.set_generate_response({"response": "a scene", "eval_count": 2, "done_reason": "stop"})
+    mock_ollama.set_generate_response(
+        {"response": "a scene", "eval_count": 2, "done_reason": "stop"}
+    )
 
-    result = CliRunner().invoke(ri.cli, [str(tmp_path), "-u", mock_ollama.url, "-w", "2"])
+    result = CliRunner().invoke(
+        ri.cli, [str(tmp_path), "-u", mock_ollama.url, "-w", "2"]
+    )
 
     assert result.exit_code == 0
     for i in range(1, 4):
         assert f"[{i}/3]" in result.output
 
 
-def test_cli_workers_partial_failure_skips_only_the_failing_image(tmp_path, mock_ollama):
+def test_cli_workers_partial_failure_skips_only_the_failing_image(
+    tmp_path, mock_ollama
+):
     """One failing image among several concurrent requests must not affect the others."""
-    mock_ollama.set_models(["qwen2.5vl:7b"])
+    mock_ollama.set_models([ri.DEFAULT_REMOTE_MODEL])
     good_content = b"GOOD" * 100
     bad_content = b"BAD" * 200
     (tmp_path / "good.jpg").write_bytes(good_content)
@@ -446,7 +702,9 @@ def test_cli_workers_partial_failure_skips_only_the_failing_image(tmp_path, mock
 
     mock_ollama.set_generate_response_fn(response_fn)
 
-    result = CliRunner().invoke(ri.cli, [str(tmp_path), "-u", mock_ollama.url, "-w", "2"])
+    result = CliRunner().invoke(
+        ri.cli, [str(tmp_path), "-u", mock_ollama.url, "-w", "2"]
+    )
 
     assert result.exit_code == 0
     assert "[SKIP] bad.jpg" in result.output
@@ -456,7 +714,7 @@ def test_cli_workers_partial_failure_skips_only_the_failing_image(tmp_path, mock
 
 def test_cli_rename_caches_exif_data(tmp_path, mock_ollama):
     """The rename flow must also populate the cache's "exif" field for every image."""
-    mock_ollama.set_models(["qwen2.5vl:7b"])
+    mock_ollama.set_models([ri.DEFAULT_REMOTE_MODEL])
     mock_ollama.set_generate_response(
         {"response": "a red square", "eval_count": 3, "done_reason": "stop"}
     )
@@ -535,3 +793,170 @@ def test_exif_cmd_omits_user_comment_unless_flag_passed(tmp_path):
 
     with_flag = CliRunner().invoke(ri.cli, ["exif", str(img), "-U", "-f", "json"])
     assert "UserComment" in json.loads(with_flag.output)["photo.jpg"]
+
+
+# ---------- hardware detection ----------
+
+
+def test_detect_nvidia_vram_gb_picks_largest_of_multiple_gpus(monkeypatch):
+    """Ollama runs a model on a single GPU, so the largest card is the right capacity estimate
+    — not the first line of nvidia-smi's output, which is arbitrary device-enumeration order."""
+    monkeypatch.setattr(ri.shutil, "which", lambda name: "/usr/bin/nvidia-smi")
+    monkeypatch.setattr(ri, "_run_command_stdout", lambda cmd: "4096\n24576\n8192")
+
+    assert ri._detect_nvidia_vram_gb() == 24576 / 1024
+
+
+def test_detect_nvidia_vram_gb_none_when_no_gpu_lines(monkeypatch):
+    monkeypatch.setattr(ri.shutil, "which", lambda name: "/usr/bin/nvidia-smi")
+    monkeypatch.setattr(ri, "_run_command_stdout", lambda cmd: "")
+
+    assert ri._detect_nvidia_vram_gb() is None
+
+
+# ---------- fit / best-match helpers ----------
+
+
+def test_fit_yes_tight_no_unknown_bands():
+    assert ri._fit(None, 10) == "?"
+    assert ri._fit(10, 10) == "yes"
+    assert ri._fit(8, 10) == "tight"  # 8 >= 10 * 0.75
+    assert ri._fit(5, 10) == "no"
+
+
+def test_fit_color_green_for_best_match_regardless_of_fit_band():
+    assert ri._fit_color("tight", is_best_match=True) == "green"
+    assert ri._fit_color("yes", is_best_match=True) == "green"
+
+
+def test_fit_color_red_for_unfit_non_best_match():
+    assert ri._fit_color("no", is_best_match=False) == "red"
+
+
+def test_fit_color_none_for_fitting_or_unknown_non_best_match():
+    assert ri._fit_color("yes", is_best_match=False) is None
+    assert ri._fit_color("tight", is_best_match=False) is None
+    assert ri._fit_color("?", is_best_match=False) is None
+
+
+def test_best_match_name_picks_largest_fitting_model():
+    rows = [
+        {"name": "small", "fits": "yes", "approx_gb_needed": 2},
+        {"name": "medium", "fits": "yes", "approx_gb_needed": 6},
+        {"name": "big", "fits": "no", "approx_gb_needed": 24},
+    ]
+    assert ri._best_match_name(rows) == "medium"
+
+
+def test_best_match_name_none_when_nothing_fits():
+    rows = [{"name": "big", "fits": "no", "approx_gb_needed": 24}]
+    assert ri._best_match_name(rows) is None
+
+
+# ---------- models command ----------
+
+
+def test_models_cmd_lists_mlx_models_on_apple_silicon(monkeypatch):
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: True)
+    monkeypatch.setattr(ri, "_detect_apple_memory_gb", lambda: 16.0)
+
+    result = CliRunner().invoke(ri.cli, ["models"])
+
+    assert result.exit_code == 0
+    assert "Apple Silicon Mac" in result.output
+    assert "unified memory: 16 GB" in result.output
+    assert ri.DEFAULT_LOCAL_MODEL in result.output
+    assert "qwen2.5vl:7b" not in result.output  # an Ollama-only tag
+
+
+def test_models_cmd_lists_ollama_models_with_nvidia_gpu(monkeypatch):
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: 8.0)
+
+    result = CliRunner().invoke(ri.cli, ["models"])
+
+    assert result.exit_code == 0
+    assert "NVIDIA GPU" in result.output
+    assert "qwen2.5vl:7b" in result.output
+    assert "fits:yes" in result.output  # 8GB covers the 6GB-rated 7b tag
+    assert "fits:no" in result.output  # 8GB doesn't cover the 24GB-rated 32b tag
+
+
+def test_models_cmd_falls_back_to_cpu_ram_when_no_gpu_detected(monkeypatch):
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: None)
+    monkeypatch.setattr(ri, "_detect_system_ram_gb", lambda: 32.0)
+
+    result = CliRunner().invoke(ri.cli, ["models"])
+
+    assert result.exit_code == 0
+    assert "no NVIDIA GPU detected" in result.output
+    assert "system RAM: 32 GB" in result.output
+
+
+def test_models_cmd_unknown_hardware_marks_every_model_fit_unknown(monkeypatch):
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: None)
+    monkeypatch.setattr(ri, "_detect_system_ram_gb", lambda: None)
+
+    result = CliRunner().invoke(ri.cli, ["models"])
+
+    assert result.exit_code == 0
+    assert "RAM unknown" in result.output
+    assert "fits:?" in result.output
+    assert "fits:yes" not in result.output
+
+
+def test_models_cmd_json_output_structure(monkeypatch):
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: None)
+    monkeypatch.setattr(ri, "_detect_system_ram_gb", lambda: None)
+
+    result = CliRunner().invoke(ri.cli, ["models", "-f", "json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["ecosystem"] == "Ollama"
+    assert data["models"]
+    assert all(m["fits"] == "?" for m in data["models"])
+    assert {"name", "params", "approx_gb_needed", "fits", "notes"} <= data["models"][
+        0
+    ].keys()
+
+
+def test_models_cmd_json_flags_best_match(monkeypatch):
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: 8.0)
+
+    result = CliRunner().invoke(ri.cli, ["models", "-f", "json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    # With 8GB detected: everything up to minicpm-v (7GB) fits; it's the largest that does.
+    best = [m["name"] for m in data["models"] if m["best_match"]]
+    assert best == ["minicpm-v"]
+
+
+def test_models_cmd_table_colors_best_match_green_and_unfit_red(monkeypatch):
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: 8.0)
+
+    result = CliRunner().invoke(ri.cli, ["models"], color=True)
+
+    assert result.exit_code == 0
+    green_lines = [line for line in result.output.splitlines() if "\x1b[32m" in line]
+    assert any("minicpm-v" in line for line in green_lines)
+    red_lines = [line for line in result.output.splitlines() if "\x1b[31m" in line]
+    assert any("llava:34b" in line for line in red_lines)
+    assert not any("minicpm-v" in line for line in red_lines)
+
+
+def test_models_cmd_strips_color_by_default_for_non_tty_output(monkeypatch):
+    """Without an explicit tty, output must stay plain text — no leaked ANSI escapes."""
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: 8.0)
+
+    result = CliRunner().invoke(ri.cli, ["models"])
+
+    assert result.exit_code == 0
+    assert "\x1b[" not in result.output
