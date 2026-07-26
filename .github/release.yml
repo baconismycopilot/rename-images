@@ -1,0 +1,24 @@
+# Configures GitHub's auto-generated release notes (the "Generate release
+# notes" button on a new Release, or `gh release create --generate-notes`):
+# groups merged PRs since the last release into these categories by label,
+# instead of one flat list. See:
+# https://docs.github.com/en/repositories/releasing-projects-on-github/automatically-generated-release-notes
+changelog:
+  exclude:
+    labels:
+      - duplicate
+      - invalid
+      - wontfix
+  categories:
+    - title: New Features
+      labels:
+        - enhancement
+    - title: Bug Fixes
+      labels:
+        - bug
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Other Changes
+      labels:
+        - "*"
