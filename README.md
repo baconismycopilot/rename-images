@@ -141,3 +141,15 @@ uv run pytest            # run tests
 ```
 
 See [CLAUDE.md](CLAUDE.md) for a deeper architectural walkthrough.
+
+## Releasing
+
+Releases are tracked as GitHub Releases (Releases tab → tags), with notes auto-generated from merged PR titles rather than hand-written each time — grouped into categories by label via [`.github/release.yml`](.github/release.yml) (`enhancement` → New Features, `bug` → Bug Fixes, `documentation` → Documentation, everything else → Other Changes). Label PRs accordingly before cutting a release so they land in the right section.
+
+To cut one:
+
+1. Bump `version` in `pyproject.toml` to match the tag you're about to create.
+2. Merge any PRs you want included, then tag the resulting commit on `main`: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+3. Create the release with auto-generated notes: `gh release create vX.Y.Z --generate-notes` (or use the "Draft a new release" button on GitHub's Releases tab, which has the same "Generate release notes" option).
+
+`gh release create` opens an editable draft of the generated notes before publishing, so it's a good point to add a short human-written summary above the auto-generated list if the release needs more context than PR titles give.
