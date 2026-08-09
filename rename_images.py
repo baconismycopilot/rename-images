@@ -400,33 +400,50 @@ def _ollama_cpu_fallback_warning(remote_url: str, model_name: str) -> str | None
     guessing: the server not answering, the model not being listed (it may
     have been unloaded already), a response with no `size_vram` field, or no
     GPU detected here at all — CPU inference on a machine with no GPU is
-    expected, not worth warning about. The hardware probe is deliberately
-    left until after the cheap HTTP check, so a healthy run never pays for it.
+    expected, not worth warning about. Parsing the response is inside the
+    same try for the same reason: a malformed/unexpected body must not raise
+    out of here and take a whole batch down with it. The hardware probe is
+    deliberately left until after the cheap HTTP check, so a healthy run
+    never pays for it.
     """
     try:
         with urllib.request.urlopen(
             f"{remote_url.rstrip('/')}/api/ps", timeout=REMOTE_PREFLIGHT_TIMEOUT_SECS
         ) as resp:
-            loaded = json.loads(resp.read()).get("models", [])
+            loaded = json.loads(resp.read()).get("models") or []
+        entry = next(
+            (e for e in loaded if model_name in (e.get("model"), e.get("name"))), None
+        )
+        size, size_vram = (entry or {}).get("size"), (entry or {}).get("size_vram")
     except Exception:
         return None
 
-    for entry in loaded:
-        if model_name not in (entry.get("model"), entry.get("name")):
-            continue
-        size, size_vram = entry.get("size"), entry.get("size_vram")
-        if not size or size_vram is None or size_vram > 0:
-            return None
-        hw = _detect_hardware()
-        if hw.gpu_vendor is None:
-            return None
-        vram = f" ({_format_gb(hw.capacity)})" if hw.capacity is not None else ""
+    if not size or size_vram is None or size_vram > 0:
+        return None
+    hw = _detect_hardware()
+    if hw.gpu_vendor is None:
+        return None
+    vram = f" ({_format_gb(hw.capacity)})" if hw.capacity is not None else ""
+    lead = (
+        f"Note: Ollama is running {model_name!r} entirely on the CPU — none of it is\n"
+        f"in VRAM — even though this machine has an {hw.gpu_vendor.upper()} GPU{vram}."
+    )
+
+    # A GPU-enabled Ollama reports size_vram == 0 for a second reason: the
+    # model doesn't fit the card at all, so not one layer gets offloaded.
+    # Telling someone to install the ROCm build they already have would send
+    # them off in the wrong direction, so check the size explanation first.
+    requirement = next(
+        (m.requirement_gb for m in OLLAMA_MODELS if m.name == model_name), None
+    )
+    if requirement is not None and _fit(hw.capacity, requirement) == "no":
         return (
-            f"Note: Ollama is running {model_name!r} entirely on the CPU — none of it is\n"
-            f"in VRAM — even though this machine has an {hw.gpu_vendor.upper()} GPU{vram}.\n"
+            f"{lead}\nIt needs roughly {_format_gb(requirement)}, more than this GPU has — "
+            "either pick a\nsmaller model (`rename-images models`) or, if you expected this "
+            "one to fit,\ncheck that Ollama is a GPU-enabled build:\n"
             f"{_OLLAMA_GPU_BUILD_HELP[hw.gpu_vendor]}"
         )
-    return None
+    return f"{lead}\n{_OLLAMA_GPU_BUILD_HELP[hw.gpu_vendor]}"
 
 
 def _remote_image_bytes(img_path: Path) -> bytes:
@@ -886,8 +903,9 @@ class HardwareInfo(NamedTuple):
     summary: str
     # Which kind of GPU the capacity figure came from, if any ("nvidia" /
     # "amd" / None for the Apple Silicon and CPU-only-RAM cases). Only
-    # consulted by check_ollama_gpu_usage(), which needs to name the right
-    # vendor's fix when Ollama turns out not to be using a GPU that's there.
+    # consulted by _ollama_cpu_fallback_warning(), which needs to name the
+    # right vendor's fix when Ollama turns out not to be using a GPU that's
+    # there.
     gpu_vendor: str | None = None
 
 

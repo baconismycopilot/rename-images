@@ -933,6 +933,28 @@ def test_no_cpu_fallback_warning_without_a_gpu_to_use(mock_ollama, monkeypatch):
     assert ri._ollama_cpu_fallback_warning(mock_ollama.url, "llava:13b") is None
 
 
+def test_cpu_fallback_warning_blames_model_size_when_it_cannot_fit(
+    mock_ollama, amd_gpu
+):
+    """A GPU-enabled Ollama reports size_vram == 0 too when not one layer of the model fits."""
+    mock_ollama.set_loaded(
+        "llava:34b", size=20_000_000_000, size_vram=0
+    )  # ~26GB on a 16GB card
+
+    warning = ri._ollama_cpu_fallback_warning(mock_ollama.url, "llava:34b")
+
+    assert warning is not None
+    assert "more than this GPU has" in warning
+    assert "rename-images models" in warning
+
+
+def test_no_cpu_fallback_warning_on_a_malformed_ps_response(mock_ollama, amd_gpu):
+    """Go marshals a nil slice as null — parsing must not raise out and take the batch with it."""
+    for payload in ({"models": None}, {"models": ["not-a-dict"]}, {}, [], "nonsense"):
+        mock_ollama.set_ps(payload)
+        assert ri._ollama_cpu_fallback_warning(mock_ollama.url, "llava:13b") is None
+
+
 def test_no_cpu_fallback_warning_when_server_cannot_be_reached(amd_gpu):
     """A diagnostic must never be the thing that breaks a run."""
     assert ri._ollama_cpu_fallback_warning("http://127.0.0.1:1", "llava:13b") is None

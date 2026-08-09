@@ -90,6 +90,10 @@ class MockOllama:
             ]
         }
 
+    def set_ps(self, payload) -> None:
+        """Set the raw /api/ps body, for shapes set_loaded() can't express (e.g. a null list)."""
+        self.server.state["ps"] = payload
+
     def set_generate_response(self, response: dict, status: int = 200) -> None:
         self.server.state["generate_response"] = response
         self.server.state["generate_status"] = status
