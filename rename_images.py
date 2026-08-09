@@ -368,6 +368,67 @@ def check_remote_backend(
         sys.exit(1)
 
 
+# How to get a GPU-enabled Ollama, per detected GPU vendor — the payload of
+# the CPU-fallback warning below. Distro packages are the usual culprit on
+# AMD: Arch's `ollama`, for one, is a CPU-only build (`ollama-rocm` is the
+# GPU one), and nothing about a run makes that visible except its speed.
+_OLLAMA_GPU_BUILD_HELP = {
+    "amd": (
+        "Ollama needs a ROCm- or Vulkan-enabled build to use an AMD GPU, and some\n"
+        "distro packages ship a CPU-only one — on Arch that's `ollama-rocm` rather\n"
+        "than `ollama`; elsewhere the official installer bundles ROCm:\n"
+        "  curl -fsSL https://ollama.com/install.sh | sh"
+    ),
+    "nvidia": (
+        "Ollama needs a CUDA-enabled build and a working NVIDIA driver to use the\n"
+        "GPU; the official installer bundles the CUDA runtime:\n"
+        "  curl -fsSL https://ollama.com/install.sh | sh"
+    ),
+}
+
+
+def _ollama_cpu_fallback_warning(remote_url: str, model_name: str) -> str | None:
+    """Warning text if Ollama has the model loaded in system RAM despite this machine having a GPU.
+
+    Ollama reports `size_vram` per loaded model on /api/ps, so a model that's
+    resident with none of it in VRAM means the server found no usable GPU —
+    almost always a CPU-only Ollama build rather than anything about this
+    tool or the model. Nothing else in a run surfaces that: it just captions
+    ~20x slower with no explanation.
+
+    Purely a diagnostic, so every ambiguous case returns None rather than
+    guessing: the server not answering, the model not being listed (it may
+    have been unloaded already), a response with no `size_vram` field, or no
+    GPU detected here at all — CPU inference on a machine with no GPU is
+    expected, not worth warning about. The hardware probe is deliberately
+    left until after the cheap HTTP check, so a healthy run never pays for it.
+    """
+    try:
+        with urllib.request.urlopen(
+            f"{remote_url.rstrip('/')}/api/ps", timeout=REMOTE_PREFLIGHT_TIMEOUT_SECS
+        ) as resp:
+            loaded = json.loads(resp.read()).get("models", [])
+    except Exception:
+        return None
+
+    for entry in loaded:
+        if model_name not in (entry.get("model"), entry.get("name")):
+            continue
+        size, size_vram = entry.get("size"), entry.get("size_vram")
+        if not size or size_vram is None or size_vram > 0:
+            return None
+        hw = _detect_hardware()
+        if hw.gpu_vendor is None:
+            return None
+        vram = f" ({_format_gb(hw.capacity)})" if hw.capacity is not None else ""
+        return (
+            f"Note: Ollama is running {model_name!r} entirely on the CPU — none of it is\n"
+            f"in VRAM — even though this machine has an {hw.gpu_vendor.upper()} GPU{vram}.\n"
+            f"{_OLLAMA_GPU_BUILD_HELP[hw.gpu_vendor]}"
+        )
+    return None
+
+
 def _remote_image_bytes(img_path: Path) -> bytes:
     """Get an image's bytes in a format the remote Ollama server can decode.
 
@@ -641,6 +702,7 @@ def rename_cmd(
                 # with many images and a small worker count, waiting until
                 # everything is done before printing anything would look
                 # exactly like a hang.
+                gpu_checked = False
                 for i, (img_path, future) in enumerate(futures.items(), start=1):
                     prefix = f"  [{i}/{len(misses)}]"
                     try:
@@ -659,6 +721,19 @@ def rename_cmd(
                         )
                         progress += f": {result.tokens} tokens{hit_limit}"
                     click.echo(progress)
+                    # The first success means the model is definitely loaded,
+                    # so this is the earliest point Ollama can be asked
+                    # whether it's actually using the GPU. Warning here rather
+                    # than after the pool drains means a long batch says so up
+                    # front, instead of once every image has already crawled
+                    # through the CPU. Local backend only, matching
+                    # _choose_ollama_default_model(): this machine's GPU says
+                    # nothing about an explicitly-targeted -u host's.
+                    if auto_local_ollama and not gpu_checked:
+                        gpu_checked = True
+                        warning = _ollama_cpu_fallback_warning(remote_url, model_name)
+                        if warning:
+                            click.echo(f"\n{warning}\n", err=True)
 
     used_names = set()
 
@@ -809,6 +884,11 @@ class HardwareInfo(NamedTuple):
     models: list[ModelInfo]
     capacity: float | None
     summary: str
+    # Which kind of GPU the capacity figure came from, if any ("nvidia" /
+    # "amd" / None for the Apple Silicon and CPU-only-RAM cases). Only
+    # consulted by check_ollama_gpu_usage(), which needs to name the right
+    # vendor's fix when Ollama turns out not to be using a GPU that's there.
+    gpu_vendor: str | None = None
 
 
 # mlx-community repo IDs for the local Apple Silicon backend. Same lineup as
@@ -845,7 +925,7 @@ MLX_MODELS = [
 ]
 
 # Ollama tags for the (auto-selected-on-non-Apple-Silicon, or explicit -u)
-# Ollama backend. requirement_gb is GPU VRAM if there's an NVIDIA GPU,
+# Ollama backend. requirement_gb is GPU VRAM if there's an NVIDIA or AMD GPU,
 # otherwise system RAM for CPU-only inference (much slower either way).
 OLLAMA_MODELS = [
     ModelInfo(
@@ -876,6 +956,16 @@ OLLAMA_MODELS = [
     ModelInfo("qwen2.5vl:32b", "32B", 24, "High quality; requires a serious GPU"),
     ModelInfo("llava:34b", "34B", 26, "High quality; requires a serious GPU"),
 ]
+
+
+# Where the kernel's DRM subsystem exposes per-GPU attributes, including the
+# amdgpu driver's VRAM sizes (see _detect_amd_vram_gb). A module constant so
+# tests can point it at a fixture directory instead of real hardware.
+_DRM_SYSFS_ROOT = Path("/sys/class/drm")
+_PCI_VENDOR_AMD = 0x1002
+# Below this, a "GPU" is an APU's integrated graphics reporting its small
+# dedicated carve-out rather than a discrete card worth sizing models against.
+_MIN_DGPU_VRAM_GB = 2.0
 
 
 def _run_command_stdout(cmd: list[str]) -> str | None:
@@ -926,6 +1016,44 @@ def _detect_nvidia_vram_gb() -> float | None:
         return None
 
 
+def _read_sysfs(path: Path) -> str:
+    """Read a sysfs attribute's text, stripped. Raises OSError if it isn't readable."""
+    return path.read_text().strip()
+
+
+def _detect_amd_vram_gb() -> float | None:
+    """Best-effort VRAM of the largest AMD GPU, read straight from sysfs; None if absent.
+
+    The amdgpu kernel driver exports each card's VRAM size in bytes at
+    /sys/class/drm/card*/device/mem_info_vram_total, so this needs no ROCm
+    install and no subprocess — rocm-smi/amd-smi are optional packages that
+    plenty of machines running Ollama on an AMD GPU simply don't have.
+
+    Cards smaller than _MIN_DGPU_VRAM_GB are skipped because that's what an
+    APU's integrated GPU looks like here: it reports only its small dedicated
+    carve-out (e.g. 0.5GB) while really working out of GTT/system RAM, so
+    treating that as this machine's capacity would mark every model as not
+    fitting — worse than falling through to the system-RAM estimate. Picking
+    the largest of what's left follows the same reasoning as the NVIDIA probe
+    above, and on a dGPU + APU machine it also lands on the real GPU.
+    """
+    vram_gb = []
+    try:
+        card_dirs = sorted(_DRM_SYSFS_ROOT.glob("card*/device"))
+    except OSError:
+        return None
+    for device in card_dirs:
+        try:
+            if int(_read_sysfs(device / "vendor"), 16) != _PCI_VENDOR_AMD:
+                continue
+            gb = int(_read_sysfs(device / "mem_info_vram_total")) / (1024**3)
+        except (OSError, ValueError):
+            continue
+        if gb >= _MIN_DGPU_VRAM_GB:
+            vram_gb.append(gb)
+    return max(vram_gb) if vram_gb else None
+
+
 def _detect_system_ram_gb() -> float | None:
     """Best-effort total system RAM for platforms/cases with no detected GPU.
 
@@ -949,10 +1077,10 @@ def _format_gb(value: float) -> str:
 def _detect_hardware() -> HardwareInfo:
     """Pick a model catalog for this machine and describe/size its detected hardware.
 
-    Capacity is unified memory on Apple Silicon, GPU VRAM if an NVIDIA GPU is
-    found elsewhere, or system RAM as a last resort for CPU-only inference —
-    whichever applies is None if it couldn't be detected at all, in which
-    case every model's fit is unknown rather than guessed.
+    Capacity is unified memory on Apple Silicon, GPU VRAM if an NVIDIA or AMD
+    GPU is found elsewhere, or system RAM as a last resort for CPU-only
+    inference — whichever applies is None if it couldn't be detected at all,
+    in which case every model's fit is unknown rather than guessed.
     """
     if is_apple_silicon():
         capacity = _detect_apple_memory_gb()
@@ -963,15 +1091,23 @@ def _detect_hardware() -> HardwareInfo:
         )
         return HardwareInfo("MLX (local, Apple Silicon)", MLX_MODELS, capacity, summary)
 
+    # NVIDIA is checked first purely so machines that already worked keep
+    # taking the exact path they did before AMD detection existed.
     vram = _detect_nvidia_vram_gb()
     if vram is not None:
         summary = f"{platform.system()} with an NVIDIA GPU — VRAM: {_format_gb(vram)} (via nvidia-smi)"
-        return HardwareInfo("Ollama", OLLAMA_MODELS, vram, summary)
+        return HardwareInfo("Ollama", OLLAMA_MODELS, vram, summary, "nvidia")
+
+    vram = _detect_amd_vram_gb()
+    if vram is not None:
+        summary = (
+            f"{platform.system()} with an AMD GPU — VRAM: {_format_gb(vram)} "
+            f"(via {_DRM_SYSFS_ROOT})"
+        )
+        return HardwareInfo("Ollama", OLLAMA_MODELS, vram, summary, "amd")
 
     ram = _detect_system_ram_gb()
-    summary = (
-        f"{platform.system()}, no NVIDIA GPU detected — CPU-only inference will be slow"
-    )
+    summary = f"{platform.system()}, no GPU detected — CPU-only inference will be slow"
     summary += (
         f"; system RAM: {_format_gb(ram)}" if ram is not None else " (RAM unknown)"
     )
