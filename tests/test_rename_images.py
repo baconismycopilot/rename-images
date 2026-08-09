@@ -557,6 +557,7 @@ def test_cli_skips_hardware_detection_when_no_images_found(tmp_path, monkeypatch
         raise AssertionError("hardware detection should not run on an empty folder")
 
     monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: _fail_if_called())
+    monkeypatch.setattr(ri, "_detect_amd_vram_gb", lambda: _fail_if_called())
     monkeypatch.setattr(ri, "_detect_system_ram_gb", lambda: _fail_if_called())
 
     result = CliRunner().invoke(ri.cli, [str(tmp_path)])
@@ -814,6 +815,180 @@ def test_detect_nvidia_vram_gb_none_when_no_gpu_lines(monkeypatch):
     assert ri._detect_nvidia_vram_gb() is None
 
 
+def _make_drm_card(root, name, vram_bytes=None, vendor="0x1002"):
+    """Build one fake /sys/class/drm/<name>/device entry; vram_bytes=None omits the VRAM file."""
+    device = root / name / "device"
+    device.mkdir(parents=True)
+    (device / "vendor").write_text(f"{vendor}\n")
+    if vram_bytes is not None:
+        (device / "mem_info_vram_total").write_text(f"{vram_bytes}\n")
+    return device
+
+
+def test_detect_amd_vram_gb_picks_dgpu_over_integrated(tmp_path, monkeypatch):
+    """The real numbers from an APU + dGPU machine: the 0.5GB iGPU carve-out must not win."""
+    _make_drm_card(tmp_path, "card0", 536870912)  # Raphael integrated graphics
+    _make_drm_card(tmp_path, "card1", 17095983104)  # Radeon RX 9070
+    monkeypatch.setattr(ri, "_DRM_SYSFS_ROOT", tmp_path)
+
+    assert ri._detect_amd_vram_gb() == 17095983104 / (1024**3)
+
+
+def test_detect_amd_vram_gb_none_when_only_integrated_graphics(tmp_path, monkeypatch):
+    """An APU works out of system RAM, so its tiny carve-out must fall through to the RAM path."""
+    _make_drm_card(tmp_path, "card0", 536870912)
+    monkeypatch.setattr(ri, "_DRM_SYSFS_ROOT", tmp_path)
+
+    assert ri._detect_amd_vram_gb() is None
+
+
+def test_detect_amd_vram_gb_ignores_other_vendors(tmp_path, monkeypatch):
+    _make_drm_card(tmp_path, "card0", 17095983104, vendor="0x10de")
+    monkeypatch.setattr(ri, "_DRM_SYSFS_ROOT", tmp_path)
+
+    assert ri._detect_amd_vram_gb() is None
+
+
+def test_detect_amd_vram_gb_none_on_missing_or_unreadable_sysfs(tmp_path, monkeypatch):
+    monkeypatch.setattr(ri, "_DRM_SYSFS_ROOT", tmp_path / "does-not-exist")
+    assert ri._detect_amd_vram_gb() is None
+
+    # A card directory with no VRAM attribute at all (non-amdgpu driver), and
+    # one whose attribute isn't a number — neither may raise.
+    _make_drm_card(tmp_path, "card0")
+    device = _make_drm_card(tmp_path, "card1", 17095983104)
+    (device / "mem_info_vram_total").write_text("not-a-number\n")
+    monkeypatch.setattr(ri, "_DRM_SYSFS_ROOT", tmp_path)
+    assert ri._detect_amd_vram_gb() is None
+
+
+def test_detect_hardware_reports_amd_gpu_when_no_nvidia(monkeypatch):
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: None)
+    monkeypatch.setattr(ri, "_detect_amd_vram_gb", lambda: 16.0)
+
+    hw = ri._detect_hardware()
+
+    assert hw.capacity == 16.0
+    assert hw.gpu_vendor == "amd"
+    assert "AMD GPU" in hw.summary
+    assert "VRAM: 16 GB" in hw.summary
+
+
+def test_detect_hardware_prefers_nvidia_when_both_present(monkeypatch):
+    """NVIDIA is probed first so machines that already worked keep their existing behavior."""
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: 24.0)
+    monkeypatch.setattr(ri, "_detect_amd_vram_gb", lambda: 16.0)
+
+    hw = ri._detect_hardware()
+
+    assert (hw.capacity, hw.gpu_vendor) == (24.0, "nvidia")
+
+
+# ---------- Ollama CPU-fallback warning ----------
+
+
+@pytest.fixture
+def amd_gpu(monkeypatch):
+    """Pretend this machine has a 16GB AMD GPU, whatever it actually has."""
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: None)
+    monkeypatch.setattr(ri, "_detect_amd_vram_gb", lambda: 16.0)
+
+
+def test_cpu_fallback_warning_when_model_is_not_in_vram(mock_ollama, amd_gpu):
+    mock_ollama.set_loaded("llava:13b", size=8_000_000_000, size_vram=0)
+
+    warning = ri._ollama_cpu_fallback_warning(mock_ollama.url, "llava:13b")
+
+    assert warning is not None
+    assert "entirely on the CPU" in warning
+    assert "AMD GPU (16 GB)" in warning
+    assert "ollama-rocm" in warning  # the actual fix, not just the diagnosis
+
+
+def test_no_cpu_fallback_warning_when_model_is_on_the_gpu(mock_ollama, amd_gpu):
+    mock_ollama.set_loaded("llava:13b", size=8_000_000_000, size_vram=8_000_000_000)
+
+    assert ri._ollama_cpu_fallback_warning(mock_ollama.url, "llava:13b") is None
+
+
+def test_no_cpu_fallback_warning_when_model_not_loaded(mock_ollama, amd_gpu):
+    """Nothing loaded (or a different model loaded) is ambiguous, not evidence of CPU inference."""
+    assert ri._ollama_cpu_fallback_warning(mock_ollama.url, "llava:13b") is None
+
+    mock_ollama.set_loaded("some-other-model", size=8_000_000_000, size_vram=0)
+    assert ri._ollama_cpu_fallback_warning(mock_ollama.url, "llava:13b") is None
+
+
+def test_no_cpu_fallback_warning_without_a_gpu_to_use(mock_ollama, monkeypatch):
+    """CPU inference on a machine with no GPU is expected — warning about it would be noise."""
+    monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
+    monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: None)
+    monkeypatch.setattr(ri, "_detect_amd_vram_gb", lambda: None)
+    monkeypatch.setattr(ri, "_detect_system_ram_gb", lambda: 32.0)
+    mock_ollama.set_loaded("llava:13b", size=8_000_000_000, size_vram=0)
+
+    assert ri._ollama_cpu_fallback_warning(mock_ollama.url, "llava:13b") is None
+
+
+def test_cpu_fallback_warning_blames_model_size_when_it_cannot_fit(
+    mock_ollama, amd_gpu
+):
+    """A GPU-enabled Ollama reports size_vram == 0 too when not one layer of the model fits."""
+    mock_ollama.set_loaded(
+        "llava:34b", size=20_000_000_000, size_vram=0
+    )  # ~26GB on a 16GB card
+
+    warning = ri._ollama_cpu_fallback_warning(mock_ollama.url, "llava:34b")
+
+    assert warning is not None
+    assert "more than this GPU has" in warning
+    assert "rename-images models" in warning
+
+
+def test_no_cpu_fallback_warning_on_a_malformed_ps_response(mock_ollama, amd_gpu):
+    """Go marshals a nil slice as null — parsing must not raise out and take the batch with it."""
+    for payload in ({"models": None}, {"models": ["not-a-dict"]}, {}, [], "nonsense"):
+        mock_ollama.set_ps(payload)
+        assert ri._ollama_cpu_fallback_warning(mock_ollama.url, "llava:13b") is None
+
+
+def test_no_cpu_fallback_warning_when_server_cannot_be_reached(amd_gpu):
+    """A diagnostic must never be the thing that breaks a run."""
+    assert ri._ollama_cpu_fallback_warning("http://127.0.0.1:1", "llava:13b") is None
+
+
+def test_cli_warns_once_about_cpu_fallback_on_local_backend(
+    tmp_path, mock_ollama, monkeypatch, amd_gpu
+):
+    monkeypatch.setattr(ri, "DEFAULT_OLLAMA_URL", mock_ollama.url)
+    mock_ollama.set_models([ri.DEFAULT_REMOTE_MODEL])
+    mock_ollama.set_loaded(ri.DEFAULT_REMOTE_MODEL, size=8_000_000_000, size_vram=0)
+    for name in ("a.jpg", "b.jpg", "c.jpg"):
+        _make_image(tmp_path / name)
+
+    result = CliRunner().invoke(ri.cli, [str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert result.stderr.count("entirely on the CPU") == 1
+
+
+def test_cli_does_not_warn_about_cpu_fallback_for_explicit_remote_host(
+    tmp_path, mock_ollama, amd_gpu
+):
+    """What this machine's GPU is doing says nothing about an explicitly-targeted host."""
+    mock_ollama.set_models([ri.DEFAULT_REMOTE_MODEL])
+    mock_ollama.set_loaded(ri.DEFAULT_REMOTE_MODEL, size=8_000_000_000, size_vram=0)
+    _make_image(tmp_path / "photo.jpg")
+
+    result = CliRunner().invoke(ri.cli, [str(tmp_path), "-u", mock_ollama.url])
+
+    assert result.exit_code == 0
+    assert "entirely on the CPU" not in result.output
+
+
 # ---------- fit / best-match helpers ----------
 
 
@@ -882,21 +1057,39 @@ def test_models_cmd_lists_ollama_models_with_nvidia_gpu(monkeypatch):
     assert "fits:no" in result.output  # 8GB doesn't cover the 24GB-rated 32b tag
 
 
+def test_models_cmd_sizes_against_amd_vram_not_system_ram(monkeypatch, amd_gpu):
+    """The bug this exists to prevent: a 16GB card being handed a 34B recommendation
+    because the only capacity figure available was 30GB of system RAM."""
+    monkeypatch.setattr(ri, "_detect_system_ram_gb", lambda: 30.0)
+
+    result = CliRunner().invoke(ri.cli, ["models", "-f", "json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "AMD GPU" in data["hardware"]
+    fits = {m["name"]: m["fits"] for m in data["models"]}
+    assert fits["llava:13b"] == "yes"  # 16GB comfortably covers the ~10GB default
+    assert fits["llava:34b"] == "no"  # ...and clearly doesn't cover a 34B
+    assert [m["name"] for m in data["models"] if m["best_match"]] == ["llava:13b"]
+
+
 def test_models_cmd_falls_back_to_cpu_ram_when_no_gpu_detected(monkeypatch):
     monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
     monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: None)
+    monkeypatch.setattr(ri, "_detect_amd_vram_gb", lambda: None)
     monkeypatch.setattr(ri, "_detect_system_ram_gb", lambda: 32.0)
 
     result = CliRunner().invoke(ri.cli, ["models"])
 
     assert result.exit_code == 0
-    assert "no NVIDIA GPU detected" in result.output
+    assert "no GPU detected" in result.output
     assert "system RAM: 32 GB" in result.output
 
 
 def test_models_cmd_unknown_hardware_marks_every_model_fit_unknown(monkeypatch):
     monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
     monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: None)
+    monkeypatch.setattr(ri, "_detect_amd_vram_gb", lambda: None)
     monkeypatch.setattr(ri, "_detect_system_ram_gb", lambda: None)
 
     result = CliRunner().invoke(ri.cli, ["models"])
@@ -910,6 +1103,7 @@ def test_models_cmd_unknown_hardware_marks_every_model_fit_unknown(monkeypatch):
 def test_models_cmd_json_output_structure(monkeypatch):
     monkeypatch.setattr(ri, "is_apple_silicon", lambda: False)
     monkeypatch.setattr(ri, "_detect_nvidia_vram_gb", lambda: None)
+    monkeypatch.setattr(ri, "_detect_amd_vram_gb", lambda: None)
     monkeypatch.setattr(ri, "_detect_system_ram_gb", lambda: None)
 
     result = CliRunner().invoke(ri.cli, ["models", "-f", "json"])

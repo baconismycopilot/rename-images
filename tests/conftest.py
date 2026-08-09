@@ -14,6 +14,12 @@ class _MockOllamaHandler(BaseHTTPRequestHandler):
                 {"models": [{"name": name} for name in self.server.state["models"]]}
             ).encode()
             self._send(200, body)
+        elif self.path == "/api/ps":
+            # Real Ollama lists currently-loaded models here, with size_vram
+            # showing how much of each is on the GPU. Defaults to none loaded,
+            # which is the "nothing to report" case the CPU-fallback warning
+            # stays quiet on — so tests that don't care are unaffected.
+            self._send(200, json.dumps(self.server.state["ps"]).encode())
         else:
             self._send(404, b"{}")
 
@@ -28,7 +34,10 @@ class _MockOllamaHandler(BaseHTTPRequestHandler):
             # for per-request status codes (e.g. simulating one failing image).
             status, body = result if isinstance(result, tuple) else (200, result)
         else:
-            status, body = self.server.state["generate_status"], self.server.state["generate_response"]
+            status, body = (
+                self.server.state["generate_status"],
+                self.server.state["generate_response"],
+            )
         self._send(status, json.dumps(body).encode())
 
     def _send(self, status, body):
@@ -57,6 +66,7 @@ class MockOllama:
                 "done_reason": "stop",
             },
             "generate_response_fn": None,
+            "ps": {"models": []},
         }
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -71,6 +81,18 @@ class MockOllama:
 
     def set_models(self, models: list[str]) -> None:
         self.server.state["models"] = models
+
+    def set_loaded(self, model: str, size: int, size_vram: int) -> None:
+        """Make /api/ps report `model` as loaded, with `size_vram` of its `size` bytes on the GPU."""
+        self.server.state["ps"] = {
+            "models": [
+                {"name": model, "model": model, "size": size, "size_vram": size_vram}
+            ]
+        }
+
+    def set_ps(self, payload) -> None:
+        """Set the raw /api/ps body, for shapes set_loaded() can't express (e.g. a null list)."""
+        self.server.state["ps"] = payload
 
     def set_generate_response(self, response: dict, status: int = 200) -> None:
         self.server.state["generate_response"] = response
